@@ -4,10 +4,11 @@ TICK_INTERVAL  ?= 300
 AGENT_INTERVAL ?= 3600
 DAYS     ?= 30
 PROMPT   ?= Run your portfolio review.
+PORT     ?= 8080
 BIN      := bin/trader
 
 .DEFAULT_GOAL := help
-.PHONY: help init build test run start stop restart status logs tick-log pnl narrative journal trades backfill tick strategies strategy set-strategy backtest clean
+.PHONY: help init build test run review serve start stop restart status logs tick-log pnl narrative journal trades backfill tick strategies strategy set-strategy backtest clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  \033[36m%-13s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -23,6 +24,12 @@ test: ## Run tests
 
 run: build ## Run one agent portfolio review now (PROMPT="..." to override)
 	scripts/run.sh "$(PROMPT)"
+
+review: build ## Ask the agent for a full review of the live strategy now
+	scripts/run.sh --requested
+
+serve: build ## Dashboard at http://localhost:PORT (8080): PnL snapshots, strategy, narrative, review button
+	@set -a; [ -f .env ] && . ./.env; set +a; $(BIN) serve -addr 127.0.0.1:$(PORT)
 
 start: build ## Start ticks every TICK_INTERVAL (300s) and agent reviews every AGENT_INTERVAL (3600s); market events wake the agent early
 	@scripts/launchd.sh install tick $(TICK_INTERVAL)

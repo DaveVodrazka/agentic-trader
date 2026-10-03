@@ -29,6 +29,8 @@ make pnl        # see how it's doing
 |---|---|
 | `make init` | Create `trader.db`. Imports old JSON state files if present, otherwise deposits `USDC=1000 SOL=0.05` (overridable). |
 | `make run` | Run one agent portfolio review now. `PROMPT="..."` overrides the prompt. |
+| `make review` | Ask the agent for a full review of the live strategy now (backtests, compare, may switch). |
+| `make serve` | Local dashboard at http://localhost:8080 (`PORT=`): PnL snapshots and chart, live strategy vs benchmarks, narrative, agent reports, and buttons to take a snapshot or request a review. No auth: localhost only. |
 | `make start` | Schedule ticks every `TICK_INTERVAL` (300 s) and agent reviews every `AGENT_INTERVAL` (3600 s) via launchd. Ticks wake the agent early on big moves, stop-losses, halts or drawdown. |
 | `make stop` | Stop both scheduled jobs. |
 | `make restart` | Rebuild and restart both jobs (after code changes). |
@@ -60,6 +62,7 @@ internal/marketdata/ historical price bars (GeckoTerminal)
 internal/store/     SQLite schema and queries
 internal/memory/    narrative + journal
 internal/mcpserver/ MCP tools the agent uses (market data, backtests, set_strategy)
+internal/web/       local dashboard (make serve)
 scripts/            tick.sh, run.sh (agent review), launchd.sh (scheduling)
 CLAUDE.md           the agent's instructions
 ```
