@@ -13,8 +13,9 @@ import (
 	"agentic-trader/internal/store"
 )
 
-// runBeginRun records the start of an agent run and prints the memory block
-// for the agent's system prompt.
+// runBeginRun records the start of an agent run, claims pending wake-ups,
+// and prints the context block (why it runs, narrative, journal) for the
+// agent's system prompt.
 func runBeginRun(ctx context.Context, app *app, args []string) error {
 	fs := flag.NewFlagSet("begin-run", flag.ExitOnError)
 	runID := fs.String("run-id", "", "run ID (required)")
@@ -26,10 +27,15 @@ func runBeginRun(ctx context.Context, app *app, args []string) error {
 	if err := app.requireInitialized(ctx); err != nil {
 		return err
 	}
-	if err := app.store.BeginRun(ctx, *runID, *prompt, time.Now()); err != nil {
+	now := time.Now()
+	if err := app.store.BeginRun(ctx, *runID, *prompt, now); err != nil {
 		return err
 	}
-	block, err := app.memory().Context(ctx, *runID)
+	wakeups, err := app.store.ClaimWakeups(ctx, *runID, now)
+	if err != nil {
+		return err
+	}
+	block, err := app.memory().Context(ctx, *runID, wakeups)
 	if err != nil {
 		return err
 	}

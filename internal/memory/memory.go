@@ -22,15 +22,18 @@ const DefaultNarrativePath = "NARRATIVE.md"
 // run and forces the agent to drop stale reasoning.
 const DefaultMaxNarrativeBytes = 4096
 
-// RecentJournalEntries is how many journal entries the agent sees each run.
-const RecentJournalEntries = 5
+// RecentJournalEntries is how many journal entries the agent sees each run
+// (about half a day at hourly reviews).
+const RecentJournalEntries = 12
 
 // RequiredSections must appear as "## <name>" headings in the narrative.
 var RequiredSections = []string{
-	"Market view",
-	"Positions & plan",
-	"Next run: watch for",
-	"Lessons",
+	"Market view",     // regime: trending, ranging, volatile, risk-off
+	"Active strategy", // which one and with what params
+	"Why",             // the reasoning for the choice
+	"Evidence",        // backtests and live results it rests on
+	"Switch if",       // what would make you change strategy
+	"Lessons",         // what past choices taught you
 }
 
 // Validation errors returned by Update.
@@ -106,11 +109,21 @@ func (m *Memory) writeView(n store.Narrative) error {
 	return nil
 }
 
-// Context renders the memory block given to the agent at the start of a run.
-func (m *Memory) Context(ctx context.Context, runID string) (string, error) {
+// Context renders the block given to the agent at the start of a run: why
+// it is running (wake-ups, if any), its narrative and recent journal.
+func (m *Memory) Context(ctx context.Context, runID string, wakeups []store.Wakeup) (string, error) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Memory from previous runs\n\nCurrent time: %s\nRun ID: %s\n\n## Your narrative\n",
+	fmt.Fprintf(&b, "# Context\n\nCurrent time: %s\nRun ID: %s\n\n## Why you are running now\n",
 		m.now().UTC().Format(time.RFC3339), runID)
+	if len(wakeups) == 0 {
+		b.WriteString("Routine hourly review.\n")
+	} else {
+		b.WriteString("Woken early by market events:\n")
+		for _, w := range wakeups {
+			fmt.Fprintf(&b, "- %s %s\n", w.At.UTC().Format("15:04Z"), w.Detail)
+		}
+	}
+	b.WriteString("\n## Your narrative\n")
 	n, ok, err := m.st.LatestNarrative(ctx)
 	if err != nil {
 		return "", err

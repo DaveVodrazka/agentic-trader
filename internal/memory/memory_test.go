@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agentic-trader/internal/store"
 )
@@ -14,11 +15,17 @@ import (
 const valid = `## Market view
 SOL ranging.
 
-## Positions & plan
-- SOL 1 (paper-1). Exit if <115.
+## Active strategy
+rebalance 50/50
 
-## Next run: watch for
-- SOL < 117.
+## Why
+Range-bound, low trend.
+
+## Evidence
+30d backtest +9% vs hold +10%, lower drawdown.
+
+## Switch if
+SOL daily trend turns up with MA20 > MA50.
 
 ## Lessons
 - none yet`
@@ -54,11 +61,11 @@ func TestUpdateStoresAndWritesView(t *testing.T) {
 		t.Errorf("journal = %+v", j)
 	}
 
-	c, err := m.Context(ctx, "run-3")
+	c, err := m.Context(ctx, "run-3", []store.Wakeup{{At: time.Now(), Detail: "SOL -6.0% in the last hour"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Run ID: run-3", "SOL breaking out.", "run-1: bought SOL", "run-2: waited"} {
+	for _, want := range []string{"Run ID: run-3", "Woken early", "SOL -6.0% in the last hour", "SOL breaking out.", "run-1: bought SOL", "run-2: waited"} {
 		if !strings.Contains(c, want) {
 			t.Errorf("context missing %q:\n%s", want, c)
 		}
@@ -67,8 +74,8 @@ func TestUpdateStoresAndWritesView(t *testing.T) {
 
 func TestContextFirstRun(t *testing.T) {
 	m, _, _ := newMemory(t)
-	c, err := m.Context(context.Background(), "run-1")
-	if err != nil || !strings.Contains(c, "first run") || !strings.Contains(c, "(empty)") {
+	c, err := m.Context(context.Background(), "run-1", nil)
+	if err != nil || !strings.Contains(c, "first run") || !strings.Contains(c, "(empty)") || !strings.Contains(c, "Routine hourly review") {
 		t.Errorf("context = %q, err = %v", c, err)
 	}
 }

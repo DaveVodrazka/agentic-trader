@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -109,4 +110,21 @@ func TestJupiterQuoteLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log(quote)
+}
+
+func TestJupiterUSDPrices(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Query().Get("ids"), "So11111111111111111111111111111111111111112") {
+			t.Errorf("ids = %q", r.URL.Query().Get("ids"))
+		}
+		w.Write([]byte(`{"So11111111111111111111111111111111111111112":{"usdPrice":119.3},"EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm":null}`))
+	}))
+	defer srv.Close()
+	reg := NewTokenRegistry(SolanaTokens...)
+	sol, _ := reg.Lookup("SOL")
+	wif, _ := reg.Lookup("WIF")
+	prices, err := NewJupiter(WithJupiterPriceURL(srv.URL)).USDPrices(context.Background(), []Token{sol, wif})
+	if err != nil || prices["SOL"] != 119.3 || len(prices) != 1 {
+		t.Errorf("prices = %v err = %v", prices, err)
+	}
 }

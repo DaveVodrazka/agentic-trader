@@ -29,6 +29,9 @@ type Order struct {
 	Quote  *venue.Quote
 	Reason string // why the agent is trading; required for the audit trail
 	RunID  string // agent activation that placed the order
+	// ActivationID is the strategy activation that placed the order (0 for
+	// direct agent trades).
+	ActivationID int64
 }
 
 // Executor executes orders.
@@ -50,8 +53,10 @@ type Fill struct {
 	At        time.Time
 	RunID     string
 	Reason    string
-	QuotedOut *big.Int // the quote's expected output, for slippage tracking
-	Costs     Costs
+	// ActivationID links the trade to the strategy that placed it.
+	ActivationID int64
+	QuotedOut    *big.Int // the quote's expected output, for slippage tracking
+	Costs        Costs
 }
 
 // Limits are hard safety rules enforced regardless of what the agent decides.
@@ -119,19 +124,20 @@ func (e *PaperExecutor) Execute(ctx context.Context, o Order) (*Fill, error) {
 		return nil, err
 	}
 	fill := &Fill{
-		ID:        id,
-		Venue:     q.Venue,
-		From:      q.From,
-		To:        q.To,
-		InAmount:  new(big.Int).Set(q.InAmount),
-		OutAmount: new(big.Int).Set(q.OutAmount),
-		Price:     q.Price().FloatString(int(q.To.Decimals)),
-		Paper:     true,
-		At:        now,
-		RunID:     o.RunID,
-		Reason:    strings.TrimSpace(o.Reason),
-		QuotedOut: new(big.Int).Set(q.OutAmount),
-		Costs:     costs,
+		ID:           id,
+		Venue:        q.Venue,
+		From:         q.From,
+		To:           q.To,
+		InAmount:     new(big.Int).Set(q.InAmount),
+		OutAmount:    new(big.Int).Set(q.OutAmount),
+		Price:        q.Price().FloatString(int(q.To.Decimals)),
+		Paper:        true,
+		At:           now,
+		RunID:        o.RunID,
+		Reason:       strings.TrimSpace(o.Reason),
+		ActivationID: o.ActivationID,
+		QuotedOut:    new(big.Int).Set(q.OutAmount),
+		Costs:        costs,
 	}
 	// Record re-checks the balance atomically, so concurrent executions
 	// cannot overdraw the wallet.

@@ -158,6 +158,89 @@ CREATE TABLE snapshot_holdings (
 	PRIMARY KEY (snapshot_id, symbol)
 ) STRICT;
 `,
+
+	// v2: strategies and market data.
+	`
+-- OHLC price bars in USD. interval: '5m', '1h', '1d'. start is the bar's
+-- open time. Floats: these drive signals and charts, not accounting.
+CREATE TABLE candles (
+	symbol   TEXT NOT NULL REFERENCES tokens(symbol),
+	interval TEXT NOT NULL,
+	start    TEXT NOT NULL,
+	open     REAL NOT NULL,
+	high     REAL NOT NULL,
+	low      REAL NOT NULL,
+	close    REAL NOT NULL,
+	source   TEXT NOT NULL,
+	PRIMARY KEY (symbol, interval, start)
+) STRICT;
+
+-- Which strategy runs, with what parameters and why. At most one row has
+-- ended_at NULL (the live one). state holds the strategy's and risk
+-- layer's memory between ticks (JSON).
+CREATE TABLE strategy_activations (
+	id          INTEGER PRIMARY KEY,
+	strategy    TEXT NOT NULL,
+	params      TEXT NOT NULL,
+	reason      TEXT NOT NULL,
+	set_by      TEXT NOT NULL,
+	run_id      TEXT REFERENCES runs(id),
+	started_at  TEXT NOT NULL,
+	ended_at    TEXT,
+	status      TEXT NOT NULL CHECK (status IN ('active', 'halted', 'ended')),
+	halt_reason TEXT,
+	state       TEXT NOT NULL DEFAULT '{}'
+) STRICT;
+CREATE UNIQUE INDEX strategy_activations_one_live ON strategy_activations((ended_at IS NULL)) WHERE ended_at IS NULL;
+
+-- One row per strategy tick: what it wanted and what it did.
+CREATE TABLE strategy_ticks (
+	id            INTEGER PRIMARY KEY,
+	activation_id INTEGER NOT NULL REFERENCES strategy_activations(id),
+	at            TEXT NOT NULL,
+	value_usdc    TEXT NOT NULL,
+	targets       TEXT NOT NULL,  -- JSON {symbol: weight}
+	actions       TEXT NOT NULL,  -- JSON [{from,to,amount,trade_id,error}]
+	note          TEXT NOT NULL
+) STRICT;
+CREATE INDEX strategy_ticks_activation_at ON strategy_ticks(activation_id, at);
+
+ALTER TABLE trades ADD COLUMN activation_id INTEGER REFERENCES strategy_activations(id);
+`,
+
+	// v3: incremental backfill bookkeeping.
+	`
+-- Per token and interval: which pool the provider prices it from, the
+-- oldest bar the provider has served, and the newest bar already checked.
+-- Missing bars before checked_through are provider gaps, not re-requested.
+CREATE TABLE backfill_state (
+	symbol          TEXT NOT NULL REFERENCES tokens(symbol),
+	interval        TEXT NOT NULL,
+	provider        TEXT NOT NULL,
+	pool            TEXT NOT NULL,
+	pool_name       TEXT NOT NULL,
+	earliest        TEXT,
+	checked_through TEXT,
+	updated_at      TEXT NOT NULL,
+	PRIMARY KEY (symbol, interval)
+) STRICT;
+`,
+
+	// v4: event wake-ups for the agent.
+	`
+-- Market events that should wake the agent before its next scheduled
+-- review. run_id is set when a run picks the wake-up up.
+CREATE TABLE wakeups (
+	id      INTEGER PRIMARY KEY,
+	at      TEXT NOT NULL,
+	kind    TEXT NOT NULL,  -- halt, stop, drawdown, move, stale
+	key     TEXT NOT NULL,  -- debounce key, e.g. "move:SOL"
+	detail  TEXT NOT NULL,
+	run_id  TEXT REFERENCES runs(id)
+) STRICT;
+CREATE INDEX wakeups_key_at ON wakeups(key, at);
+CREATE INDEX wakeups_pending ON wakeups(run_id) WHERE run_id IS NULL;
+`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

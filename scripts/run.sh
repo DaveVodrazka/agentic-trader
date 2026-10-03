@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs one trading cycle of the agent with its memory loaded.
+# Runs one portfolio review by the agent, with its memory loaded.
 # Usage: scripts/run.sh ["optional prompt"]
 #
 # Env:
@@ -23,7 +23,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 export TRADER_RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)"
-PROMPT="${1:-Run your trading cycle.}"
+PROMPT="${1:-Run your portfolio review.}"
 TIMEOUT="${TRADER_TIMEOUT:-600}"
 mkdir -p logs
 LOG="logs/${TRADER_RUN_ID}.log"
@@ -39,7 +39,7 @@ echo "== ${TRADER_RUN_ID} started $(date -u +%FT%TZ)" | tee "$LOG"
 claude -p "$PROMPT" \
   --append-system-prompt "$memory" \
   --mcp-config "$mcp_config" --strict-mcp-config \
-  --allowedTools "mcp__trader__get_quote,mcp__trader__execute,mcp__trader__get_balances,mcp__trader__update_narrative" \
+  --allowedTools "mcp__trader__market_summary,mcp__trader__get_candles,mcp__trader__strategy_status,mcp__trader__list_strategies,mcp__trader__compare_strategies,mcp__trader__backtest,mcp__trader__set_strategy,mcp__trader__get_balances,mcp__trader__update_narrative" \
   > >(tee -a "$LOG") 2>&1 &
 pid=$!
 

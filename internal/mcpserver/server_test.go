@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math/big"
-	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,78 +18,60 @@ import (
 	"agentic-trader/internal/venue"
 )
 
-// fakeVenue quotes 1 USDC = 0.01 SOL.
-type fakeVenue struct{ tokens *venue.TokenRegistry }
+var now = time.Date(2026, 10, 3, 14, 30, 0, 0, time.UTC)
 
-func (fakeVenue) Name() string { return "fake" }
-
-func (f fakeVenue) Quote(_ context.Context, r venue.QuoteRequest) (*venue.Quote, error) {
-	from, err := f.tokens.Lookup(r.From)
-	if err != nil {
-		return nil, err
-	}
-	to, err := f.tokens.Lookup(r.To)
-	if err != nil {
-		return nil, err
-	}
-	in, err := venue.ParseUnits(r.Amount, from.Decimals)
-	if err != nil {
-		return nil, err
-	}
-	out := new(big.Int).Div(new(big.Int).Mul(in, big.NewInt(10_000_000)), big.NewInt(1_000_000)) // USDC(6) -> SOL(9) at 0.01
-	return &venue.Quote{Venue: "fake", From: from, To: to, InAmount: in, OutAmount: out, MinOutAmount: out, FetchedAt: time.Now()}, nil
-}
-
-func connect(t *testing.T) (*mcp.ClientSession, *store.Store, string) {
+func connect(t *testing.T) (*mcp.ClientSession, *store.Store) {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "test.db"))
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
 	tokens := venue.NewTokenRegistry(venue.SolanaTokens...)
-	ctx0 := context.Background()
 	var toks []store.Token
 	for _, tk := range venue.SolanaTokens {
 		toks = append(toks, store.Token{Symbol: tk.Symbol, Mint: tk.Address, Decimals: tk.Decimals})
 	}
-	if err := db.UpsertTokens(ctx0, toks); err != nil {
-		t.Fatal(err)
-	}
-	for _, d := range []store.Deposit{
-		{At: time.Now(), Symbol: "USDC", Amount: big.NewInt(1000e6), ValueUSDC: "1000"},
-		{At: time.Now(), Symbol: "SOL", Amount: big.NewInt(1e8), ValueUSDC: "1"},
-	} {
-		if err := db.AddDeposit(ctx0, d); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ledger := trading.NewLedger(db, tokens)
-	sol, _ := tokens.Lookup("SOL")
-	costs := trading.CostEstimator{Fees: trading.DefaultPaperFees, Pricer: trading.VenuePricer{Venue: fakeVenue{tokens}}, SOL: sol}
-	s := New(Config{
-		Venue:    fakeVenue{tokens},
-		Executor: trading.NewPaperExecutor(ledger, trading.DefaultLimits, costs),
-		Costs:    costs,
-		Ledger:   ledger,
-		Memory:   memory.New(db, filepath.Join(dir, "NARRATIVE.md"), 0),
-		Store:    db,
-		QuoteTTL: trading.DefaultLimits.MaxQuoteAge,
-		RunID:    "run-test",
-	})
+	must(t, db.UpsertTokens(ctx, toks))
+	must(t, db.AddDeposit(ctx, store.Deposit{At: now, Symbol: "USDC", Amount: big.NewInt(1000e6), ValueUSDC: "1000"}))
 
-	ctx := context.Background()
+	// 900 hourly and 90 daily SOL bars, gently rising, ending at "now".
+	var cs []store.Candle
+	for i := 0; i < 900; i++ {
+		p := 100 + float64(i)*0.02
+		cs = append(cs, store.Candle{Symbol: "SOL", Interval: "1h", Start: now.Truncate(time.Hour).Add(-time.Duration(899-i) * time.Hour),
+			Open: p, High: p, Low: p, Close: p, Source: "test"})
+	}
+	for i := 0; i < 90; i++ {
+		p := 80 + float64(i)*0.4
+		cs = append(cs, store.Candle{Symbol: "SOL", Interval: "1d", Start: now.Truncate(24 * time.Hour).Add(-time.Duration(90-i) * 24 * time.Hour),
+			Open: p, High: p, Low: p, Close: p, Source: "test"})
+	}
+	must(t, db.UpsertCandles(ctx, cs, store.ReplaceAll))
+
+	s := New(Config{
+		Store: db, Tokens: tokens, Ledger: trading.NewLedger(db, tokens),
+		Memory:  memory.New(db, filepath.Join(t.TempDir(), "NARRATIVE.md"), 0),
+		Symbols: []string{"SOL", "JUP"}, RunID: "run-test", Now: func() time.Time { return now },
+	})
 	st, ct := mcp.NewInMemoryTransports()
 	if _, err := s.MCP().Connect(ctx, st, nil); err != nil {
 		t.Fatal(err)
 	}
-	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil).Connect(ctx, ct, nil)
+	cs2, err := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil).Connect(ctx, ct, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cs.Close() })
-	return cs, db, dir
+	t.Cleanup(func() { cs2.Close() })
+	return cs2, db
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func call[T any](t *testing.T, cs *mcp.ClientSession, name string, args any) (T, *mcp.CallToolResult) {
@@ -118,89 +100,106 @@ func errText(res *mcp.CallToolResult) string {
 	return ""
 }
 
-func TestQuoteExecuteFlow(t *testing.T) {
-	cs, _, _ := connect(t)
-
-	q, res := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "USDC", "to": "SOL", "amount": "100"})
-	if res.IsError {
-		t.Fatalf("get_quote: %s", errText(res))
+func TestToolSet(t *testing.T) {
+	cs, _ := connect(t)
+	res, err := cs.ListTools(context.Background(), nil)
+	must(t, err)
+	var names []string
+	for _, tool := range res.Tools {
+		names = append(names, tool.Name)
 	}
-	if q.Out != "1" || !strings.HasPrefix(q.QuoteID, "q-") || q.ExpiresAt.IsZero() || q.Costs.NetworkFeeSOL != "0.000105" {
-		t.Errorf("quote = %+v", q)
-	}
-
-	fill, res := call[ExecuteOutput](t, cs, "execute", map[string]any{"quote_id": q.QuoteID, "reason": "test"})
-	if res.IsError {
-		t.Fatalf("execute: %s", errText(res))
-	}
-	// 0.1 + 1 bought - 0.000105 network fee
-	if fill.TradeID == "" || fill.Balances["USDC"] != "900" || fill.Balances["SOL"] != "1.099895" || fill.FeeSOL != "0.000105" {
-		t.Errorf("fill = %+v", fill)
-	}
-
-	// A quote executes at most once.
-	_, res = call[ExecuteOutput](t, cs, "execute", map[string]any{"quote_id": q.QuoteID, "reason": "test"})
-	if !res.IsError || !strings.Contains(errText(res), "unknown or expired") {
-		t.Errorf("re-execute: isError=%v %q", res.IsError, errText(res))
-	}
-
-	bal, _ := call[BalancesOutput](t, cs, "get_balances", map[string]any{})
-	if bal.Balances["USDC"] != "900" {
-		t.Errorf("balances = %v", bal.Balances)
+	sort.Strings(names)
+	want := "backtest,compare_strategies,get_balances,get_candles,list_strategies,market_summary,set_strategy,strategy_status,update_narrative"
+	if strings.Join(names, ",") != want {
+		t.Errorf("tools = %v", names)
 	}
 }
 
-func TestErrorsReachModel(t *testing.T) {
-	cs, _, _ := connect(t)
-
-	_, res := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "NOPE", "to": "SOL", "amount": "1"})
-	if !res.IsError || !strings.Contains(errText(res), "unknown token") {
-		t.Errorf("unknown token: isError=%v %q", res.IsError, errText(res))
+func TestMarketTools(t *testing.T) {
+	cs, _ := connect(t)
+	sum, res := call[MarketSummaryOutput](t, cs, "market_summary", map[string]any{})
+	if res.IsError {
+		t.Fatal(errText(res))
+	}
+	if len(sum.Tokens) != 2 || sum.Tokens[0].Symbol != "SOL" || sum.Tokens[0].Trend1h != "up" || sum.Tokens[1].Price != "" {
+		t.Errorf("summary = %+v", sum)
 	}
 
-	q, _ := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "USDC", "to": "SOL", "amount": "5000"})
-	_, res = call[ExecuteOutput](t, cs, "execute", map[string]any{"quote_id": q.QuoteID, "reason": "test"})
-	if !res.IsError || !strings.Contains(errText(res), "insufficient balance") {
-		t.Errorf("overdraw: isError=%v %q", res.IsError, errText(res))
+	bars, res := call[GetCandlesOutput](t, cs, "get_candles", map[string]any{"symbol": "SOL", "interval": "1h", "limit": 500})
+	if res.IsError || len(bars.Bars) != maxCandles || !bars.Bars[0].Start.Before(bars.Bars[99].Start) {
+		t.Errorf("candles: %d bars, err=%s", len(bars.Bars), errText(res))
 	}
-}
-
-func TestNarrativeLinksRunTrades(t *testing.T) {
-	cs, db, dir := connect(t)
-
-	q, _ := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "USDC", "to": "SOL", "amount": "10"})
-	// reason is required by the input schema.
-	_, res := call[ExecuteOutput](t, cs, "execute", map[string]any{"quote_id": q.QuoteID})
+	_, res = call[GetCandlesOutput](t, cs, "get_candles", map[string]any{"symbol": "SOL", "interval": "5m"})
 	if !res.IsError {
-		t.Fatal("execute without reason should fail")
+		t.Error("5m should be rejected")
 	}
-	q, _ = call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "USDC", "to": "SOL", "amount": "10"})
-	fill, res := call[ExecuteOutput](t, cs, "execute", map[string]any{"quote_id": q.QuoteID, "reason": "range bottom"})
-	if res.IsError {
-		t.Fatalf("execute: %s", errText(res))
+}
+
+func TestStrategyTools(t *testing.T) {
+	cs, db := connect(t)
+
+	list, _ := call[ListStrategiesOutput](t, cs, "list_strategies", map[string]any{})
+	if len(list.Strategies) != 6 || !strings.Contains(list.Rules, "stop-loss") {
+		t.Errorf("list = %+v", list)
 	}
 
-	_, res = call[UpdateNarrativeOutput](t, cs, "update_narrative", map[string]any{"narrative": "## Market view\nonly this", "summary": "x"})
-	if !res.IsError || !strings.Contains(errText(res), "missing required section") {
-		t.Errorf("invalid narrative: isError=%v %q", res.IsError, errText(res))
+	cmp, res := call[CompareOutput](t, cs, "compare_strategies", map[string]any{"days": 14})
+	if res.IsError || len(cmp.Ranking) != 8 {
+		t.Fatalf("compare: %+v %s", cmp, errText(res))
+	}
+	_, res = call[CompareOutput](t, cs, "compare_strategies", map[string]any{"days": 90})
+	if !res.IsError {
+		t.Error("days > 40 should be rejected")
 	}
 
-	out, res := call[UpdateNarrativeOutput](t, cs, "update_narrative", map[string]any{"narrative": memory.Template(), "summary": "bought SOL"})
-	if res.IsError {
-		t.Fatalf("update_narrative: %s", errText(res))
+	bt, res := call[BacktestOutput](t, cs, "backtest", map[string]any{"strategy": "trend", "params": map[string]any{"fast": 10, "slow": 30}, "days": 14})
+	if res.IsError || !strings.Contains(bt.Result.Params, `"fast":10`) || len(bt.Benchmarks) != 2 {
+		t.Errorf("backtest: %+v %s", bt, errText(res))
 	}
-	if out.RunID != "run-test" || len(out.TradeIDs) != 1 || out.TradeIDs[0] != fill.TradeID {
-		t.Errorf("out = %+v, want trade %s", out, fill.TradeID)
+	_, res = call[BacktestOutput](t, cs, "backtest", map[string]any{"strategy": "trend", "params": map[string]any{"bogus": 1}, "days": 14})
+	if !res.IsError {
+		t.Error("unknown param should be rejected")
 	}
-	trades, _ := db.Trades(context.Background())
-	if len(trades) != 1 || trades[0].Reason != "range bottom" || trades[0].RunID != "run-test" {
-		t.Errorf("trades = %+v", trades)
+
+	status, _ := call[StrategyStatusOutput](t, cs, "strategy_status", map[string]any{})
+	if status.Live {
+		t.Error("no strategy should be live")
 	}
-	// Both quotes were recorded; only the executed one is linked to the trade.
-	if id, found, err := db.QuoteTrade(context.Background(), q.QuoteID); err != nil || !found || id != fill.TradeID {
-		t.Errorf("quote link = %q found=%v err=%v", id, found, err)
+
+	set, res := call[SetStrategyOutput](t, cs, "set_strategy", map[string]any{"strategy": "voltarget", "reason": "calm market"})
+	if res.IsError || set.ActivationID == 0 {
+		t.Fatalf("set: %+v %s", set, errText(res))
 	}
-	if _, err := os.Stat(filepath.Join(dir, "NARRATIVE.md")); err != nil {
-		t.Error(err)
+	_, res = call[SetStrategyOutput](t, cs, "set_strategy", map[string]any{"strategy": "cash", "reason": "changed my mind"})
+	if !res.IsError || !strings.Contains(errText(res), "can switch in") {
+		t.Errorf("min hold not enforced: %s", errText(res))
+	}
+
+	status, _ = call[StrategyStatusOutput](t, cs, "strategy_status", map[string]any{})
+	if !status.Live || status.Performance.Strategy != "voltarget" || status.Performance.CanSwitchIn == "" {
+		t.Errorf("status = %+v", status)
+	}
+	a, _, _ := db.LiveStrategy(context.Background())
+	if a.SetBy != "agent" || a.RunID != "run-test" {
+		t.Errorf("activation = %+v", a)
+	}
+}
+
+func TestNarrativeAndBalances(t *testing.T) {
+	cs, db := connect(t)
+	bal, _ := call[BalancesOutput](t, cs, "get_balances", map[string]any{})
+	if bal.Balances["USDC"] != "1000" {
+		t.Errorf("balances = %+v", bal)
+	}
+	_, res := call[UpdateNarrativeOutput](t, cs, "update_narrative", map[string]any{"narrative": "## Market view\nx", "summary": "s"})
+	if !res.IsError || !strings.Contains(errText(res), "## Active strategy") {
+		t.Errorf("missing sections not reported: %s", errText(res))
+	}
+	out, res := call[UpdateNarrativeOutput](t, cs, "update_narrative", map[string]any{"narrative": memory.Template(), "summary": "chose voltarget"})
+	if res.IsError || !out.Saved {
+		t.Fatalf("update: %s", errText(res))
+	}
+	if j, _ := db.Journal(context.Background(), 0); len(j) != 1 || j[0].RunID != "run-test" {
+		t.Errorf("journal = %+v", j)
 	}
 }
