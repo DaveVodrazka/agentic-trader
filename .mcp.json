@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "trader": {
+      "command": "go",
+      "args": ["run", "./cmd/trader-mcp"],
+      "env": {
+        "JUPITER_API_KEY": "${JUPITER_API_KEY:-}",
+        "TRADER_RUN_ID": "${TRADER_RUN_ID:-}"
+      }
+    }
+  }
+}

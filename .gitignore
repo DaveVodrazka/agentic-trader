@@ -1,0 +1,21 @@
+# Build output
+bin/
+/main
+
+# Secrets
+.env
+
+# Per-user trading state: each clone starts its own wallet and history
+WALLET.json
+INITIAL_WALLET.json
+trades.jsonl
+journal.jsonl
+NARRATIVE.md
+
+# Runtime
+logs/
+*.lock
+.*.tmp
+
+# OS
+.DS_Store
