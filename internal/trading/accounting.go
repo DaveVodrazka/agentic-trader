@@ -85,6 +85,8 @@ func (l *Ledger) Record(ctx context.Context, f *Fill) (*store.Trade, error) {
 		Price:     f.Price,
 		Reason:    f.Reason,
 		Fees:      tradeFees(f.Costs),
+
+		ActivationID: f.ActivationID,
 	}
 	if err := l.st.RecordTrade(ctx, t); err != nil {
 		return nil, l.humanize(err)

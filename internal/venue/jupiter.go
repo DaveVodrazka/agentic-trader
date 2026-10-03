@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,9 +21,13 @@ const (
 	DefaultJupiterSlippageBps = 50
 )
 
+// DefaultJupiterPriceURL is Jupiter's Price API v3 endpoint.
+const DefaultJupiterPriceURL = "https://api.jup.ag/price/v3"
+
 // Jupiter is a Venue backed by the Jupiter aggregator on Solana.
 type Jupiter struct {
 	baseURL     string
+	priceURL    string
 	apiKey      string
 	slippageBps uint16
 	http        *http.Client
@@ -36,6 +41,9 @@ type JupiterOption func(*Jupiter)
 
 // WithJupiterBaseURL overrides the API base URL (e.g. for tests or lite-api).
 func WithJupiterBaseURL(u string) JupiterOption { return func(j *Jupiter) { j.baseURL = u } }
+
+// WithJupiterPriceURL overrides the Price API URL (e.g. for tests).
+func WithJupiterPriceURL(u string) JupiterOption { return func(j *Jupiter) { j.priceURL = u } }
 
 // WithJupiterAPIKey sets the x-api-key header (from portal.jup.ag).
 func WithJupiterAPIKey(k string) JupiterOption { return func(j *Jupiter) { j.apiKey = k } }
@@ -55,6 +63,7 @@ func WithJupiterTokens(r *TokenRegistry) JupiterOption { return func(j *Jupiter)
 func NewJupiter(opts ...JupiterOption) *Jupiter {
 	j := &Jupiter{
 		baseURL:     DefaultJupiterBaseURL,
+		priceURL:    DefaultJupiterPriceURL,
 		slippageBps: DefaultJupiterSlippageBps,
 		http:        &http.Client{Timeout: 10 * time.Second},
 		tokens:      NewTokenRegistry(SolanaTokens...),
@@ -184,4 +193,48 @@ func (j *Jupiter) Quote(ctx context.Context, req QuoteRequest) (*Quote, error) {
 		FetchedAt:      time.Now(),
 		Raw:            json.RawMessage(body),
 	}, nil
+}
+
+// USDPrices returns the USD price per unit of each token, in one request.
+// Tokens Jupiter has no price for are omitted.
+func (j *Jupiter) USDPrices(ctx context.Context, tokens []Token) (map[string]float64, error) {
+	ids := make([]string, 0, len(tokens))
+	bySymbol := make(map[string]string, len(tokens))
+	for _, t := range tokens {
+		ids = append(ids, t.Address)
+		bySymbol[t.Address] = t.Symbol
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, j.priceURL+"?ids="+url.QueryEscape(strings.Join(ids, ",")), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if j.apiKey != "" {
+		req.Header.Set("x-api-key", j.apiKey)
+	}
+	resp, err := j.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("jupiter prices: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("jupiter prices: read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{Venue: j.Name(), StatusCode: resp.StatusCode, Body: string(body)}
+	}
+	var raw map[string]*struct {
+		USDPrice float64 `json:"usdPrice"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("jupiter prices: decode: %w", err)
+	}
+	out := make(map[string]float64, len(raw))
+	for mint, p := range raw {
+		if sym, ok := bySymbol[mint]; ok && p != nil && p.USDPrice > 0 {
+			out[sym] = p.USDPrice
+		}
+	}
+	return out, nil
 }

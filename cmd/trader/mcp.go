@@ -10,11 +10,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"agentic-trader/internal/mcpserver"
-	"agentic-trader/internal/trading"
 )
 
-// runMCP serves the trading tools on stdio for one agent run. Concurrent
-// servers are safe: balance checks and updates are database transactions.
+// runMCP serves the portfolio-manager tools on stdio for one agent run.
 func runMCP(ctx context.Context, app *app, args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	fs.Parse(args)
@@ -31,28 +29,13 @@ func runMCP(ctx context.Context, app *app, args []string) error {
 	}
 	log.Printf("run %s, db %s", runID, app.dbPath)
 
-	jup := app.jupiter()
-	sol, err := app.tokens.Lookup("SOL")
-	if err != nil {
-		return err
-	}
-	costs := trading.CostEstimator{
-		Fees:   trading.DefaultPaperFees,
-		Pricer: &trading.CachedPricer{Pricer: trading.VenuePricer{Venue: jup}, TTL: 30 * time.Second},
-		SOL:    sol,
-	}
-	limits := trading.DefaultLimits
-	ledger := app.ledger()
-
 	srv := mcpserver.New(mcpserver.Config{
-		Venue:    jup,
-		Executor: trading.NewPaperExecutor(ledger, limits, costs),
-		Ledger:   ledger,
-		Memory:   app.memory(),
-		Store:    app.store,
-		Costs:    costs,
-		QuoteTTL: limits.MaxQuoteAge,
-		RunID:    runID,
+		Store:   app.store,
+		Tokens:  app.tokens,
+		Ledger:  app.ledger(),
+		Memory:  app.memory(),
+		Symbols: app.symbols(),
+		RunID:   runID,
 	}).MCP()
 	return srv.Run(ctx, &mcp.StdioTransport{})
 }

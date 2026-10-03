@@ -8,7 +8,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>{{REPO_DIR}}/scripts/run.sh</string>
+    <string>{{REPO_DIR}}/{{SCRIPT}}</string>
   </array>
   <key>WorkingDirectory</key>
   <string>{{REPO_DIR}}</string>
@@ -25,8 +25,8 @@
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>{{REPO_DIR}}/logs/launchd.log</string>
+  <string>{{REPO_DIR}}/logs/launchd-{{JOB}}.log</string>
   <key>StandardErrorPath</key>
-  <string>{{REPO_DIR}}/logs/launchd.log</string>
+  <string>{{REPO_DIR}}/logs/launchd-{{JOB}}.log</string>
 </dict>
 </plist>

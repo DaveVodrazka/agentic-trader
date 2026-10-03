@@ -227,6 +227,9 @@ type Trade struct {
 	QuotedOut *big.Int // nil if unknown
 	Price     string   // To per one From
 	Reason    string
+	// ActivationID is the strategy activation that placed the trade (0 if
+	// the agent traded directly).
+	ActivationID int64
 
 	// Fees is nil for trades from before fee tracking.
 	Fees *TradeFees
@@ -281,11 +284,11 @@ func (s *Store) RecordTrade(ctx context.Context, t *Trade) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO trades(
 				id, seq, run_id, at, venue, paper, from_symbol, to_symbol, in_amount, out_amount, quoted_out,
 				price, reason, fees_tracked, network_fee_lamports, platform_fee, price_impact_pct,
-				network_fee_usdc, platform_fee_usdc, impact_usdc)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				network_fee_usdc, platform_fee_usdc, impact_usdc, activation_id)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			t.ID, seq, nullStr(t.RunID), ts(t.At), t.Venue, t.Paper, t.From, t.To, in, out, nullInt(t.QuotedOut),
 			t.Price, t.Reason, tracked, f.NetworkLamports, nullInt(f.PlatformFee), nullStr(f.PriceImpactPct),
-			nullStr(f.NetworkUSDC), nullStr(f.PlatformUSDC), nullStr(f.ImpactUSDC)); err != nil {
+			nullStr(f.NetworkUSDC), nullStr(f.PlatformUSDC), nullStr(f.ImpactUSDC), nullID(t.ActivationID)); err != nil {
 			return err
 		}
 		if err := addBalance(ctx, tx, t.From, -in, t.At); err != nil {
@@ -369,7 +372,8 @@ func (e *BalanceError) Unwrap() error { return ErrInsufficientBalance }
 func (s *Store) Trades(ctx context.Context) ([]Trade, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, seq, coalesce(run_id,''), at, venue, paper, from_symbol, to_symbol,
 			in_amount, out_amount, quoted_out, price, reason, fees_tracked, network_fee_lamports, platform_fee,
-			coalesce(price_impact_pct,''), coalesce(network_fee_usdc,''), coalesce(platform_fee_usdc,''), coalesce(impact_usdc,'')
+			coalesce(price_impact_pct,''), coalesce(network_fee_usdc,''), coalesce(platform_fee_usdc,''), coalesce(impact_usdc,''),
+			coalesce(activation_id, 0)
 		FROM trades ORDER BY seq`)
 	if err != nil {
 		return nil, err
@@ -385,7 +389,7 @@ func (s *Store) Trades(ctx context.Context) ([]Trade, error) {
 		var f TradeFees
 		if err := rows.Scan(&t.ID, &t.Seq, &t.RunID, &at, &t.Venue, &t.Paper, &t.From, &t.To, &in, &outAmt, &quoted,
 			&t.Price, &t.Reason, &tracked, &f.NetworkLamports, &platform, &f.PriceImpactPct, &f.NetworkUSDC,
-			&f.PlatformUSDC, &f.ImpactUSDC); err != nil {
+			&f.PlatformUSDC, &f.ImpactUSDC, &t.ActivationID); err != nil {
 			return nil, err
 		}
 		t.At, t.InAmount, t.OutAmount = parseTS(at), big.NewInt(in), big.NewInt(outAmt)
@@ -825,6 +829,440 @@ func (s *Store) snapshotHoldings(ctx context.Context, id int64) ([]SnapshotHoldi
 	return out, rows.Err()
 }
 
+// ---- candles -------------------------------------------------------------
+
+// Candle is an OHLC price bar in USD.
+type Candle struct {
+	Symbol   string
+	Interval string // "5m", "1h", "1d"
+	Start    time.Time
+	Open     float64
+	High     float64
+	Low      float64
+	Close    float64
+	Source   string
+}
+
+// CandleWrite says how UpsertCandles treats bars that already exist.
+type CandleWrite int
+
+const (
+	// InsertMissing keeps every existing bar.
+	InsertMissing CandleWrite = iota
+	// ReplaceSameSource refreshes existing bars from the same source (e.g.
+	// a provider's previously in-progress bar) but keeps bars from others,
+	// such as our own ticks.
+	ReplaceSameSource
+	// ReplaceAll overwrites existing bars.
+	ReplaceAll
+)
+
+// UpsertCandles stores bars (e.g. from a backfill); mode decides what
+// happens to existing bars with the same symbol, interval and start.
+func (s *Store) UpsertCandles(ctx context.Context, candles []Candle, mode CandleWrite) error {
+	q := `INSERT INTO candles(symbol, interval, start, open, high, low, close, source) VALUES(?,?,?,?,?,?,?,?)`
+	switch mode {
+	case InsertMissing:
+		q += ` ON CONFLICT(symbol, interval, start) DO NOTHING`
+	case ReplaceSameSource:
+		q += ` ON CONFLICT(symbol, interval, start) DO UPDATE SET open=excluded.open, high=excluded.high,
+			low=excluded.low, close=excluded.close WHERE candles.source = excluded.source`
+	case ReplaceAll:
+		q += ` ON CONFLICT(symbol, interval, start) DO UPDATE SET open=excluded.open, high=excluded.high,
+			low=excluded.low, close=excluded.close, source=excluded.source`
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		for _, c := range candles {
+			if _, err := tx.ExecContext(ctx, q, c.Symbol, c.Interval, ts(c.Start), c.Open, c.High, c.Low, c.Close, c.Source); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// CandleStarts returns the start times of stored bars at or after from,
+// oldest first.
+func (s *Store) CandleStarts(ctx context.Context, symbol, interval string, from time.Time) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT start FROM candles WHERE symbol=? AND interval=? AND start >= ? ORDER BY start`,
+		symbol, interval, ts(from))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []time.Time
+	for rows.Next() {
+		var st string
+		if err := rows.Scan(&st); err != nil {
+			return nil, err
+		}
+		out = append(out, parseTS(st))
+	}
+	return out, rows.Err()
+}
+
+// DeleteCandle removes one bar.
+func (s *Store) DeleteCandle(ctx context.Context, symbol, interval string, start time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM candles WHERE symbol=? AND interval=? AND start=?`, symbol, interval, ts(start))
+	return err
+}
+
+// EarliestCandle returns the start of the oldest stored bar.
+func (s *Store) EarliestCandle(ctx context.Context, symbol, interval string) (time.Time, bool, error) {
+	var st sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT min(start) FROM candles WHERE symbol=? AND interval=?`, symbol, interval).Scan(&st)
+	if err != nil || !st.Valid {
+		return time.Time{}, false, err
+	}
+	return parseTS(st.String), true, nil
+}
+
+// BackfillState is the backfill bookkeeping for one symbol and interval.
+type BackfillState struct {
+	Symbol         string
+	Interval       string
+	Provider       string
+	Pool           string
+	PoolName       string
+	Earliest       time.Time // oldest bar the provider has served (zero if unknown)
+	CheckedThrough time.Time // newest bar already requested (zero if never)
+}
+
+// GetBackfillState returns the state for symbol/interval; ok is false if
+// there is none.
+func (s *Store) GetBackfillState(ctx context.Context, symbol, interval string) (BackfillState, bool, error) {
+	b := BackfillState{Symbol: symbol, Interval: interval}
+	var earliest, checked sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT provider, pool, pool_name, earliest, checked_through FROM backfill_state
+		WHERE symbol=? AND interval=?`, symbol, interval).Scan(&b.Provider, &b.Pool, &b.PoolName, &earliest, &checked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return b, false, nil
+	}
+	if err != nil {
+		return b, false, err
+	}
+	if earliest.Valid {
+		b.Earliest = parseTS(earliest.String)
+	}
+	if checked.Valid {
+		b.CheckedThrough = parseTS(checked.String)
+	}
+	return b, true, nil
+}
+
+// SaveBackfillState upserts backfill state.
+func (s *Store) SaveBackfillState(ctx context.Context, b BackfillState, now time.Time) error {
+	opt := func(t time.Time) any {
+		if t.IsZero() {
+			return nil
+		}
+		return ts(t)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO backfill_state(symbol, interval, provider, pool, pool_name, earliest,
+			checked_through, updated_at) VALUES(?,?,?,?,?,?,?,?)
+		ON CONFLICT(symbol, interval) DO UPDATE SET provider=excluded.provider, pool=excluded.pool,
+			pool_name=excluded.pool_name, earliest=excluded.earliest, checked_through=excluded.checked_through,
+			updated_at=excluded.updated_at`,
+		b.Symbol, b.Interval, b.Provider, b.Pool, b.PoolName, opt(b.Earliest), opt(b.CheckedThrough), ts(now))
+	return err
+}
+
+// AddPriceTicks folds price observations into the bars of each interval
+// (open on first tick, high/low extended, close updated) and records them in
+// the prices table.
+func (s *Store) AddPriceTicks(ctx context.Context, at time.Time, prices map[string]float64, intervals map[string]time.Duration, source string) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		for sym, p := range prices {
+			for name, d := range intervals {
+				start := at.UTC().Truncate(d)
+				if _, err := tx.ExecContext(ctx, `INSERT INTO candles(symbol, interval, start, open, high, low, close, source)
+						VALUES(?,?,?,?,?,?,?,?)
+						ON CONFLICT(symbol, interval, start) DO UPDATE SET high=max(high, excluded.high),
+						low=min(low, excluded.low), close=excluded.close`,
+					sym, name, ts(start), p, p, p, p, source); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO prices(at, symbol, price_usdc, source) VALUES(?,?,?,?)`,
+				ts(at), sym, fmt.Sprintf("%.12g", p), source); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Candles returns bars for symbol and interval whose start is in [from, to),
+// oldest first.
+func (s *Store) Candles(ctx context.Context, symbol, interval string, from, to time.Time) ([]Candle, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT start, open, high, low, close, source FROM candles
+		WHERE symbol=? AND interval=? AND start >= ? AND start < ? ORDER BY start`,
+		symbol, interval, ts(from), ts(to))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Candle
+	for rows.Next() {
+		c := Candle{Symbol: symbol, Interval: interval}
+		var start string
+		if err := rows.Scan(&start, &c.Open, &c.High, &c.Low, &c.Close, &c.Source); err != nil {
+			return nil, err
+		}
+		c.Start = parseTS(start)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ---- strategies ------------------------------------------------------------
+
+// Activation statuses.
+const (
+	StatusActive = "active"
+	StatusHalted = "halted" // stopped by the risk layer; needs a new activation
+	StatusEnded  = "ended"
+)
+
+// Activation is a strategy put in charge of the portfolio.
+type Activation struct {
+	ID         int64
+	Strategy   string
+	Params     string // JSON
+	Reason     string
+	SetBy      string // "agent" or "user"
+	RunID      string
+	StartedAt  time.Time
+	EndedAt    time.Time // zero while live
+	Status     string
+	HaltReason string
+	State      string // JSON
+}
+
+// LiveStrategy returns the current (not ended) activation, if any.
+func (s *Store) LiveStrategy(ctx context.Context) (Activation, bool, error) {
+	a, err := scanActivation(s.db.QueryRowContext(ctx, `SELECT `+activationCols+` FROM strategy_activations WHERE ended_at IS NULL`))
+	if errors.Is(err, sql.ErrNoRows) {
+		return a, false, nil
+	}
+	return a, err == nil, err
+}
+
+// StartStrategy ends the live activation (if any) and starts a new one,
+// setting a.ID.
+func (s *Store) StartStrategy(ctx context.Context, a *Activation) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE strategy_activations SET ended_at=?, status=? WHERE ended_at IS NULL`,
+			ts(a.StartedAt), StatusEnded); err != nil {
+			return err
+		}
+		if a.RunID != "" {
+			if err := ensureRun(ctx, tx, a.RunID, a.StartedAt); err != nil {
+				return err
+			}
+		}
+		if a.State == "" {
+			a.State = "{}"
+		}
+		res, err := tx.ExecContext(ctx, `INSERT INTO strategy_activations(strategy, params, reason, set_by, run_id,
+				started_at, status, state) VALUES(?,?,?,?,?,?,?,?)`,
+			a.Strategy, a.Params, a.Reason, a.SetBy, nullStr(a.RunID), ts(a.StartedAt), StatusActive, a.State)
+		if err != nil {
+			return err
+		}
+		a.ID, err = res.LastInsertId()
+		a.Status = StatusActive
+		return err
+	})
+}
+
+// SaveStrategyState persists an activation's state; if haltReason is set the
+// activation is halted.
+func (s *Store) SaveStrategyState(ctx context.Context, id int64, state, haltReason string) error {
+	if haltReason != "" {
+		_, err := s.db.ExecContext(ctx, `UPDATE strategy_activations SET state=?, status=?, halt_reason=? WHERE id=?`,
+			state, StatusHalted, haltReason, id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE strategy_activations SET state=? WHERE id=?`, state, id)
+	return err
+}
+
+// Activations returns activations newest first (limit <= 0 for all).
+func (s *Store) Activations(ctx context.Context, limit int) ([]Activation, error) {
+	if limit <= 0 {
+		limit = -1
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+activationCols+` FROM strategy_activations ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Activation
+	for rows.Next() {
+		a, err := scanActivation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+const activationCols = `id, strategy, params, reason, set_by, coalesce(run_id,''), started_at, coalesce(ended_at,''),
+	status, coalesce(halt_reason,''), state`
+
+func scanActivation(row interface{ Scan(...any) error }) (Activation, error) {
+	var a Activation
+	var started, ended string
+	err := row.Scan(&a.ID, &a.Strategy, &a.Params, &a.Reason, &a.SetBy, &a.RunID, &started, &ended, &a.Status,
+		&a.HaltReason, &a.State)
+	a.StartedAt = parseTS(started)
+	if ended != "" {
+		a.EndedAt = parseTS(ended)
+	}
+	return a, err
+}
+
+// Tick is one evaluation of the live strategy.
+type Tick struct {
+	ActivationID int64
+	At           time.Time
+	ValueUSDC    string
+	Targets      string // JSON
+	Actions      string // JSON
+	Note         string
+}
+
+// RecordTick stores a strategy tick.
+func (s *Store) RecordTick(ctx context.Context, t Tick) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO strategy_ticks(activation_id, at, value_usdc, targets, actions, note)
+		VALUES(?,?,?,?,?,?)`, t.ActivationID, ts(t.At), t.ValueUSDC, t.Targets, t.Actions, t.Note)
+	return err
+}
+
+// TickRange returns the first and last tick of an activation and the count.
+func (s *Store) TickRange(ctx context.Context, activationID int64) (first, last Tick, n int, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM strategy_ticks WHERE activation_id=?`, activationID).Scan(&n)
+	if err != nil || n == 0 {
+		return first, last, n, err
+	}
+	get := func(order string) (Tick, error) {
+		var t Tick
+		var at string
+		err := s.db.QueryRowContext(ctx, `SELECT activation_id, at, value_usdc, targets, actions, note FROM strategy_ticks
+			WHERE activation_id=? ORDER BY id `+order+` LIMIT 1`, activationID).
+			Scan(&t.ActivationID, &at, &t.ValueUSDC, &t.Targets, &t.Actions, &t.Note)
+		t.At = parseTS(at)
+		return t, err
+	}
+	if first, err = get("ASC"); err != nil {
+		return
+	}
+	last, err = get("DESC")
+	return
+}
+
+// RecentTicks returns the last n ticks of an activation, newest first.
+func (s *Store) RecentTicks(ctx context.Context, activationID int64, n int) ([]Tick, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT activation_id, at, value_usdc, targets, actions, note FROM strategy_ticks
+		WHERE activation_id=? ORDER BY id DESC LIMIT ?`, activationID, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Tick
+	for rows.Next() {
+		var t Tick
+		var at string
+		if err := rows.Scan(&t.ActivationID, &at, &t.ValueUSDC, &t.Targets, &t.Actions, &t.Note); err != nil {
+			return nil, err
+		}
+		t.At = parseTS(at)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ---- agent wake-ups ----------------------------------------------------------
+
+// Wakeup is a market event that should prompt an early agent review.
+type Wakeup struct {
+	ID     int64
+	At     time.Time
+	Kind   string
+	Key    string
+	Detail string
+	RunID  string // empty while pending
+}
+
+// AddWakeup records a wake-up unless one with the same key was recorded
+// within cooldown; added reports whether it was recorded.
+func (s *Store) AddWakeup(ctx context.Context, w Wakeup, cooldown time.Duration) (added bool, err error) {
+	err = s.tx(ctx, func(tx *sql.Tx) error {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM wakeups WHERE key=? AND at > ?`,
+			w.Key, ts(w.At.Add(-cooldown))).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO wakeups(at, kind, key, detail) VALUES(?,?,?,?)`, ts(w.At), w.Kind, w.Key, w.Detail)
+		added = err == nil
+		return err
+	})
+	return added, err
+}
+
+// ClaimWakeups marks all pending wake-ups as handled by runID and returns
+// them, oldest first.
+func (s *Store) ClaimWakeups(ctx context.Context, runID string, at time.Time) ([]Wakeup, error) {
+	var out []Wakeup
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT id, at, kind, key, detail FROM wakeups WHERE run_id IS NULL ORDER BY at, id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var w Wakeup
+			var wat string
+			if err := rows.Scan(&w.ID, &wat, &w.Kind, &w.Key, &w.Detail); err != nil {
+				rows.Close()
+				return err
+			}
+			w.At, w.RunID = parseTS(wat), runID
+			out = append(out, w)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil || len(out) == 0 {
+			return err
+		}
+		if err := ensureRun(ctx, tx, runID, at); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE wakeups SET run_id=? WHERE run_id IS NULL`, runID)
+		return err
+	})
+	return out, err
+}
+
+// PendingWakeups counts wake-ups no run has handled yet.
+func (s *Store) PendingWakeups(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM wakeups WHERE run_id IS NULL`).Scan(&n)
+	return n, err
+}
+
+// LastRunStart returns when the most recent agent run started.
+func (s *Store) LastRunStart(ctx context.Context) (time.Time, bool, error) {
+	var at sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT max(started_at) FROM runs`).Scan(&at); err != nil || !at.Valid {
+		return time.Time{}, false, err
+	}
+	return parseTS(at.String), true, nil
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 func toInt64(n *big.Int) (int64, error) {
@@ -842,6 +1280,13 @@ func nullInt(n *big.Int) any {
 		return nil
 	}
 	return n.Int64()
+}
+
+func nullID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
 }
 
 func nullStr(s string) any {

@@ -1,280 +1,314 @@
-// Package mcpserver exposes trading tools (quote, execute, balances) over MCP
-// so an LLM agent such as `claude -p` can trade.
+// Package mcpserver exposes the portfolio-manager tools over MCP so an LLM
+// agent (claude -p) can study the market, test strategies, choose which one
+// trades, and keep its narrative. The agent does not place trades itself:
+// the live strategy does, on every tick.
 package mcpserver
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"math/big"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"agentic-trader/internal/memory"
 	"agentic-trader/internal/store"
+	"agentic-trader/internal/strategy"
 	"agentic-trader/internal/trading"
 	"agentic-trader/internal/venue"
 )
 
-// ErrUnknownQuote means a quote_id was never issued, already executed, or expired.
-var ErrUnknownQuote = errors.New("unknown or expired quote_id; call get_quote again")
-
-// Config holds the dependencies behind the MCP tools.
+// Config holds the dependencies behind the tools.
 type Config struct {
-	Venue    venue.Venue
-	Executor trading.Executor
-	Ledger   *trading.Ledger
-	Memory   *memory.Memory
-	Store    *store.Store // records quotes and prices
-	Costs    trading.CostEstimator
-	// QuoteTTL should match the executor's MaxQuoteAge so the expires_at
-	// reported to the model is accurate.
-	QuoteTTL time.Duration
-	// RunID identifies this agent activation; it tags trades and the journal.
-	RunID string
+	Store   *store.Store
+	Tokens  *venue.TokenRegistry
+	Ledger  *trading.Ledger
+	Memory  *memory.Memory
+	Symbols []string // tokens strategies may trade
+	RunID   string   // this agent activation
+	Now     func() time.Time
 }
 
-// Server implements the MCP tools. Quotes are kept server-side and
-// referenced by ID so the model cannot alter amounts.
-type Server struct {
-	cfg Config
-	now func() time.Time
-
-	mu       sync.Mutex
-	quotes   map[string]*venue.Quote
-	tradeIDs []string // trades executed during this run
-}
+// Server implements the MCP tools.
+type Server struct{ cfg Config }
 
 // New returns a Server for cfg.
 func New(cfg Config) *Server {
-	return &Server{cfg: cfg, now: time.Now, quotes: make(map[string]*venue.Quote)}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return &Server{cfg: cfg}
 }
 
-// MCP returns an MCP server with the trading tools registered.
+// Limits on agent requests, to keep tool output small.
+const (
+	maxCandles      = 100
+	maxBacktestDays = 40 // hourly history covers ~41 days
+)
+
+// MCP returns an MCP server with the tools registered.
 func (s *Server) MCP() *mcp.Server {
-	srv := mcp.NewServer(&mcp.Implementation{Name: "trader", Version: "0.1.0"}, nil)
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "get_quote",
-		Description: "Get a swap quote on Solana via " + s.cfg.Venue.Name() + ". " +
-			"Sells `amount` of `from` for `to`. Returns a quote_id to pass to execute. " +
-			"Quotes expire quickly (see expires_at); re-quote if execute reports it stale.",
-	}, s.getQuote)
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "execute",
-		Description: "Execute a previously fetched quote by quote_id. Each quote can be executed once. " +
-			"`reason` is required: state the thesis behind the trade and what would invalidate it. " +
-			"Returns the fill and updated wallet balances.",
-	}, s.execute)
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "get_balances",
-		Description: "Get current wallet balances by token symbol.",
-	}, s.getBalances)
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "update_narrative",
-		Description: fmt.Sprintf("Save your trading narrative (working memory for your next run) and a journal entry for this run. "+
-			"Call once at the end of every run, including runs with no trades. "+
-			"`narrative` replaces the previous one entirely: markdown, max %d bytes, with exactly these headings:\n%s"+
-			"Under Positions & plan, cite trade IDs and give an exit/invalidation condition for each position. "+
-			"Never state balances as fact in the narrative; get_balances is the source of truth. "+
-			"`summary` is what you observed, decided and why during this run.",
-			s.cfg.Memory.MaxBytes(), memory.Template()),
-	}, s.updateNarrative)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "trader", Version: "0.2.0"}, nil)
+	add := func(name, desc string) *mcp.Tool { return &mcp.Tool{Name: name, Description: desc} }
+
+	mcp.AddTool(srv, add("market_summary",
+		"Per-token market overview from stored price bars: price, 24h/7d/30d change, 30d volatility, hourly and daily "+
+			"trend (MA20 vs MA50), RSI, position in the 30-day range, 30-day max drawdown, correlation to SOL, and data "+
+			"freshness. Start every run here."), s.marketSummary)
+	mcp.AddTool(srv, add("get_candles",
+		fmt.Sprintf("Raw OHLC price bars for one token, newest last. interval: 1h or 1d. At most %d bars.", maxCandles)),
+		s.getCandles)
+	mcp.AddTool(srv, add("list_strategies",
+		"The available trading strategies with what they do and their default params."), s.listStrategies)
+	mcp.AddTool(srv, add("compare_strategies",
+		fmt.Sprintf("Backtest every strategy at default params plus benchmarks (hold SOL, 50/50) over the last `days` "+
+			"(1-%d), ranked by return. Includes trading costs.", maxBacktestDays)), s.compareStrategies)
+	mcp.AddTool(srv, add("backtest",
+		fmt.Sprintf("Backtest one strategy with specific params over the last `days` (1-%d), next to the benchmarks. "+
+			"Use to test a param choice before set_strategy. Short windows overfit: prefer evidence that holds over "+
+			"several windows.", maxBacktestDays)), s.backtest)
+	mcp.AddTool(srv, add("strategy_status",
+		"The live strategy: params, reason, how long it has run, its return since activation vs the benchmarks over "+
+			"the same window, trades and costs, entry prices, stop-outs, last decision, and when it may be replaced."),
+		s.strategyStatus)
+	mcp.AddTool(srv, add("set_strategy",
+		fmt.Sprintf("Make a strategy live; it trades from the next tick. `reason` is required: the evidence and what "+
+			"would make you switch. A healthy strategy must run %s before it can be replaced; a halted one can be "+
+			"replaced any time. Switching costs fees, so only switch on clear evidence.", strategy.MinHold)), s.setStrategy)
+	mcp.AddTool(srv, add("get_balances", "Current wallet balances by token symbol."), s.getBalances)
+	mcp.AddTool(srv, add("update_narrative",
+		fmt.Sprintf("Save your narrative (working memory for your next run) and a journal entry for this run. Call once "+
+			"at the end of every run, even if nothing changed. `narrative` replaces the previous one: markdown, max %d "+
+			"bytes, with exactly these headings:\n%s`summary` is what you observed, decided and why.",
+			s.cfg.Memory.MaxBytes(), memory.Template())), s.updateNarrative)
 	return srv
 }
 
-// GetQuoteInput is the input of get_quote.
-type GetQuoteInput struct {
-	From        string `json:"from" jsonschema:"token symbol to sell, e.g. USDC"`
-	To          string `json:"to" jsonschema:"token symbol to buy, e.g. SOL"`
-	Amount      string `json:"amount" jsonschema:"amount of 'from' to sell as a decimal string, e.g. \"100\" or \"0.5\""`
-	SlippageBps uint16 `json:"slippage_bps,omitempty" jsonschema:"max slippage in basis points; omit for default (50 = 0.5%)"`
+// history loads the price bars the tools need.
+func (s *Server) history(ctx context.Context, days int) (*strategy.MemData, error) {
+	now := s.cfg.Now().UTC()
+	return strategy.LoadHistory(ctx, s.cfg.Store, s.cfg.Symbols, now.Add(-time.Duration(days+150)*24*time.Hour), now)
 }
 
-// QuoteOutput is the output of get_quote.
-type QuoteOutput struct {
-	QuoteID        string      `json:"quote_id"`
-	Venue          string      `json:"venue"`
-	From           string      `json:"from"`
-	To             string      `json:"to"`
-	In             string      `json:"in"`
-	Out            string      `json:"out"`
-	MinOut         string      `json:"min_out" jsonschema:"worst-case output after slippage"`
-	Price          string      `json:"price" jsonschema:"units of 'to' per one 'from'"`
-	PriceImpactPct string      `json:"price_impact_pct" jsonschema:"price impact in percent (1 = 1%)"`
-	Costs          CostsOutput `json:"costs" jsonschema:"estimated total cost of executing this quote"`
-	SlippageBps    uint16      `json:"slippage_bps"`
-	Route          []string    `json:"route"`
-	ExpiresAt      time.Time   `json:"expires_at"`
+// ---- market_summary ----------------------------------------------------------
+
+// MarketSummaryOutput is the output of market_summary.
+type MarketSummaryOutput struct {
+	AsOf   time.Time             `json:"as_of"`
+	Tokens []strategy.TokenStats `json:"tokens"`
 }
 
-func (s *Server) getQuote(ctx context.Context, _ *mcp.CallToolRequest, in GetQuoteInput) (*mcp.CallToolResult, QuoteOutput, error) {
-	q, err := s.cfg.Venue.Quote(ctx, venue.QuoteRequest{
-		From: in.From, To: in.To, Amount: in.Amount, SlippageBps: in.SlippageBps,
-	})
+func (s *Server) marketSummary(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, MarketSummaryOutput, error) {
+	data, err := s.history(ctx, 60)
 	if err != nil {
-		return nil, QuoteOutput{}, err
+		return nil, MarketSummaryOutput{}, err
 	}
-	id, err := newQuoteID()
+	return nil, MarketSummaryOutput{AsOf: data.Now, Tokens: strategy.Summarize(data, s.cfg.Symbols)}, nil
+}
+
+// ---- get_candles ---------------------------------------------------------------
+
+// GetCandlesInput is the input of get_candles.
+type GetCandlesInput struct {
+	Symbol   string `json:"symbol" jsonschema:"token symbol, e.g. SOL"`
+	Interval string `json:"interval" jsonschema:"1h or 1d"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"number of bars, default 48, max 100"`
+}
+
+// Bar is one OHLC bar.
+type Bar struct {
+	Start time.Time `json:"start"`
+	Open  float64   `json:"open"`
+	High  float64   `json:"high"`
+	Low   float64   `json:"low"`
+	Close float64   `json:"close"`
+}
+
+// GetCandlesOutput is the output of get_candles.
+type GetCandlesOutput struct {
+	Symbol   string `json:"symbol"`
+	Interval string `json:"interval"`
+	Bars     []Bar  `json:"bars"`
+}
+
+func (s *Server) getCandles(ctx context.Context, _ *mcp.CallToolRequest, in GetCandlesInput) (*mcp.CallToolResult, GetCandlesOutput, error) {
+	dur, ok := strategy.Intervals[in.Interval]
+	if !ok || in.Interval == "5m" {
+		return nil, GetCandlesOutput{}, errors.New("interval must be 1h or 1d")
+	}
+	tok, err := s.cfg.Tokens.Lookup(in.Symbol)
 	if err != nil {
-		return nil, QuoteOutput{}, err
+		return nil, GetCandlesOutput{}, err
 	}
-
-	s.mu.Lock()
-	s.pruneLocked()
-	s.quotes[id] = q
-	s.mu.Unlock()
-	s.recordQuote(ctx, id, q)
-
-	return nil, QuoteOutput{
-		QuoteID:        id,
-		Venue:          q.Venue,
-		From:           q.From.Symbol,
-		To:             q.To.Symbol,
-		In:             q.In(),
-		Out:            q.Out(),
-		MinOut:         q.MinOut(),
-		Price:          q.Price().FloatString(int(q.To.Decimals)),
-		PriceImpactPct: q.PriceImpactPercent(),
-		Costs:          costsOutput(s.cfg.Costs.Estimate(ctx, q)),
-		SlippageBps:    q.SlippageBps,
-		Route:          q.Route,
-		ExpiresAt:      q.FetchedAt.Add(s.cfg.QuoteTTL).UTC(),
-	}, nil
-}
-
-// recordQuote stores the quote and, if one leg is USDC, a price point.
-// Failures are logged, not returned: history must not block trading.
-func (s *Server) recordQuote(ctx context.Context, id string, q *venue.Quote) {
-	route, _ := json.Marshal(q.Route)
-	err := s.cfg.Store.RecordQuote(ctx, store.Quote{
-		QuoteID: id, RunID: s.cfg.RunID, At: q.FetchedAt, Venue: q.Venue, From: q.From.Symbol, To: q.To.Symbol,
-		InAmount: q.InAmount, OutAmount: q.OutAmount, MinOut: q.MinOutAmount,
-		Price: q.Price().FloatString(int(q.To.Decimals)), PriceImpactPct: q.PriceImpactPercent(), Route: string(route),
-	})
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 48
+	}
+	limit = min(limit, maxCandles)
+	now := s.cfg.Now().UTC()
+	cs, err := s.cfg.Store.Candles(ctx, tok.Symbol, in.Interval, now.Add(-time.Duration(limit+1)*dur), now.Add(time.Second))
 	if err != nil {
-		log.Printf("record quote %s: %v", id, err)
-		return
+		return nil, GetCandlesOutput{}, err
 	}
-	if p, ok := quotePrice(q); ok {
-		if err := s.cfg.Store.RecordPrices(ctx, []store.Price{p}); err != nil {
-			log.Printf("record price: %v", err)
-		}
+	cs = cs[max(0, len(cs)-limit):]
+	out := GetCandlesOutput{Symbol: tok.Symbol, Interval: in.Interval, Bars: make([]Bar, len(cs))}
+	for i, c := range cs {
+		out.Bars[i] = Bar{Start: c.Start, Open: c.Open, High: c.High, Low: c.Low, Close: c.Close}
 	}
+	return nil, out, nil
 }
 
-// quotePrice derives the non-USDC token's USDC price from a quote with a
-// USDC leg. The price is the effective rate (after impact and pool fees).
-func quotePrice(q *venue.Quote) (store.Price, bool) {
-	in := new(big.Rat).SetFrac(q.InAmount, pow10(q.From.Decimals))
-	out := new(big.Rat).SetFrac(q.OutAmount, pow10(q.To.Decimals))
-	switch {
-	case in.Sign() == 0 || out.Sign() == 0:
-		return store.Price{}, false
-	case q.From.Symbol == "USDC" && q.To.Symbol != "USDC":
-		return store.Price{At: q.FetchedAt, Symbol: q.To.Symbol, USDC: new(big.Rat).Quo(in, out).FloatString(12), Source: "quote"}, true
-	case q.To.Symbol == "USDC" && q.From.Symbol != "USDC":
-		return store.Price{At: q.FetchedAt, Symbol: q.From.Symbol, USDC: new(big.Rat).Quo(out, in).FloatString(12), Source: "quote"}, true
+// ---- strategies ------------------------------------------------------------------
+
+// StrategyInfo describes a strategy.
+type StrategyInfo struct {
+	Name     string         `json:"name"`
+	Summary  string         `json:"summary"`
+	Defaults map[string]any `json:"default_params"`
+}
+
+// ListStrategiesOutput is the output of list_strategies.
+type ListStrategiesOutput struct {
+	Strategies []StrategyInfo `json:"strategies"`
+	Rules      string         `json:"risk_rules" jsonschema:"safety rules applied to every strategy"`
+}
+
+func (s *Server) listStrategies(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, ListStrategiesOutput, error) {
+	var out ListStrategiesOutput
+	for _, sp := range strategy.Specs() {
+		defaults := map[string]any{}
+		_ = json.Unmarshal(sp.DefaultParams(), &defaults)
+		out.Strategies = append(out.Strategies, StrategyInfo{Name: sp.Name, Summary: sp.Summary, Defaults: defaults})
 	}
-	return store.Price{}, false
+	r := strategy.DefaultRules
+	out.Rules = fmt.Sprintf("max %.0f%% per token; trades under $%.0f or %.0f%% of the portfolio skipped; %.2g SOL kept for "+
+		"fees; per-token stop-loss at -%.0f%% from entry (stopped tokens not re-bought until a new strategy is set); "+
+		"portfolio drawdown of %.0f%% from peak halts the strategy (all cash) until a new one is set. Tradable tokens: %s.",
+		r.MaxWeight*100, r.MinTradeUSD, r.MinTradeFrac*100, r.SOLReserve, r.StopLoss*100, r.MaxDrawdown*100,
+		strings.Join(s.cfg.Symbols, ", "))
+	return nil, out, nil
 }
 
-func pow10(d uint8) *big.Int {
-	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(d)), nil)
+// CompareInput is the input of compare_strategies.
+type CompareInput struct {
+	Days int `json:"days" jsonschema:"backtest window in days, 1-40"`
 }
 
-// CostsOutput is the cost breakdown shown to the agent. Price impact and
-// platform fee are already reflected in `out`; the network fee is charged
-// separately in SOL.
-type CostsOutput struct {
-	NetworkFeeSOL  string `json:"network_fee_sol" jsonschema:"paid in SOL on top of the trade; you must hold enough SOL"`
-	NetworkFeeUSDC string `json:"network_fee_usdc,omitempty"`
-	ImpactUSDC     string `json:"price_impact_usdc,omitempty"`
-	PlatformUSDC   string `json:"platform_fee_usdc,omitempty"`
-	TotalUSDC      string `json:"total_usdc,omitempty" jsonschema:"all costs of this trade in USDC; a trade must be expected to earn more than this"`
+// CompareOutput is the output of compare_strategies.
+type CompareOutput struct {
+	Days    int                `json:"days"`
+	Ranking []strategy.Summary `json:"ranking"`
 }
 
-func costsOutput(c trading.Costs) CostsOutput {
-	out := CostsOutput{
-		NetworkFeeSOL:  c.NetworkSOL(),
-		NetworkFeeUSDC: usdc(c.NetworkUSDC),
-		ImpactUSDC:     usdc(c.ImpactUSDC),
-		PlatformUSDC:   usdc(c.PlatformUSDC),
+func (s *Server) compareStrategies(ctx context.Context, _ *mcp.CallToolRequest, in CompareInput) (*mcp.CallToolResult, CompareOutput, error) {
+	cfg, data, err := s.backtestSetup(ctx, in.Days)
+	if err != nil {
+		return nil, CompareOutput{}, err
 	}
-	if total, ok := c.TotalUSDC(); ok {
-		out.TotalUSDC = usdc(total)
+	rows, err := strategy.Compare(data, s.cfg.Symbols, cfg, s.cfg.Tokens)
+	return nil, CompareOutput{Days: in.Days, Ranking: rows}, err
+}
+
+// BacktestInput is the input of backtest.
+type BacktestInput struct {
+	Strategy string         `json:"strategy"`
+	Params   map[string]any `json:"params,omitempty" jsonschema:"strategy params; omitted fields use defaults"`
+	Days     int            `json:"days" jsonschema:"backtest window in days, 1-40"`
+}
+
+// BacktestOutput is the output of backtest.
+type BacktestOutput struct {
+	Days       int                `json:"days"`
+	Result     strategy.Summary   `json:"result"`
+	Benchmarks []strategy.Summary `json:"benchmarks"`
+}
+
+func (s *Server) backtest(ctx context.Context, _ *mcp.CallToolRequest, in BacktestInput) (*mcp.CallToolResult, BacktestOutput, error) {
+	spec, err := strategy.Lookup(in.Strategy)
+	if err != nil {
+		return nil, BacktestOutput{}, err
 	}
-	return out
-}
-
-func usdc(r *big.Rat) string {
-	if r == nil {
-		return ""
+	params, err := rawParams(in.Params)
+	if err != nil {
+		return nil, BacktestOutput{}, err
 	}
-	return r.FloatString(4)
+	cfg, data, err := s.backtestSetup(ctx, in.Days)
+	if err != nil {
+		return nil, BacktestOutput{}, err
+	}
+	res, bench, err := strategy.RunBacktest(spec, params, data, s.cfg.Symbols, cfg, s.cfg.Tokens)
+	return nil, BacktestOutput{Days: in.Days, Result: res, Benchmarks: bench}, err
 }
 
-// ExecuteInput is the input of execute.
-type ExecuteInput struct {
-	QuoteID string `json:"quote_id" jsonschema:"quote_id returned by get_quote"`
-	Reason  string `json:"reason" jsonschema:"why you are making this trade: thesis and what would invalidate it"`
+func (s *Server) backtestSetup(ctx context.Context, days int) (strategy.BacktestConfig, *strategy.MemData, error) {
+	if days < 1 || days > maxBacktestDays {
+		return strategy.BacktestConfig{}, nil, fmt.Errorf("days must be between 1 and %d", maxBacktestDays)
+	}
+	data, err := s.history(ctx, days)
+	if err != nil {
+		return strategy.BacktestConfig{}, nil, err
+	}
+	return strategy.DefaultBacktest(data.Now.Truncate(time.Hour), days), data, nil
 }
 
-// ExecuteOutput is the output of execute.
-type ExecuteOutput struct {
-	TradeID  string            `json:"trade_id"`
-	From     string            `json:"from"`
-	To       string            `json:"to"`
-	In       string            `json:"in"`
-	Out      string            `json:"out"`
-	Price    string            `json:"price"`
-	FeeSOL   string            `json:"network_fee_sol"`
-	At       time.Time         `json:"at"`
-	Balances map[string]string `json:"balances"`
+// StrategyStatusOutput is the output of strategy_status.
+type StrategyStatusOutput struct {
+	Live        bool                  `json:"live"`
+	Performance *strategy.Performance `json:"performance,omitempty"`
+	Note        string                `json:"note,omitempty"`
 }
 
-func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, ExecuteOutput, error) {
-	// Take the quote out of the store up front so it can only execute once,
-	// even if two calls race.
-	s.mu.Lock()
-	q, ok := s.quotes[in.QuoteID]
-	delete(s.quotes, in.QuoteID)
-	s.mu.Unlock()
+func (s *Server) strategyStatus(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, StrategyStatusOutput, error) {
+	p, ok, err := strategy.LivePerformance(ctx, s.cfg.Store, s.cfg.Symbols, s.cfg.Tokens, s.cfg.Now().UTC())
+	if err != nil {
+		return nil, StrategyStatusOutput{}, err
+	}
 	if !ok {
-		return nil, ExecuteOutput{}, ErrUnknownQuote
+		return nil, StrategyStatusOutput{Note: "no strategy is live; nothing trades until you call set_strategy"}, nil
 	}
-
-	fill, err := s.cfg.Executor.Execute(ctx, trading.Order{Quote: q, Reason: in.Reason, RunID: s.cfg.RunID})
-	if err != nil {
-		return nil, ExecuteOutput{}, fmt.Errorf("execute failed, no trade made: %w", err)
-	}
-	s.mu.Lock()
-	s.tradeIDs = append(s.tradeIDs, fill.ID)
-	s.mu.Unlock()
-	if err := s.cfg.Store.MarkQuoteExecuted(ctx, in.QuoteID, fill.ID); err != nil {
-		log.Printf("link quote %s to trade %s: %v", in.QuoteID, fill.ID, err)
-	}
-	balances, err := s.cfg.Ledger.Balances(ctx)
-	if err != nil {
-		return nil, ExecuteOutput{}, fmt.Errorf("trade %s executed, but reading balances failed: %w", fill.ID, err)
-	}
-	return nil, ExecuteOutput{
-		TradeID:  fill.ID,
-		From:     fill.From.Symbol,
-		To:       fill.To.Symbol,
-		In:       venue.FormatUnits(fill.InAmount, fill.From.Decimals),
-		Out:      venue.FormatUnits(fill.OutAmount, fill.To.Decimals),
-		Price:    fill.Price,
-		FeeSOL:   fill.Costs.NetworkSOL(),
-		At:       fill.At.UTC(),
-		Balances: balances,
-	}, nil
+	return nil, StrategyStatusOutput{Live: true, Performance: &p}, nil
 }
+
+// SetStrategyInput is the input of set_strategy.
+type SetStrategyInput struct {
+	Strategy string         `json:"strategy"`
+	Params   map[string]any `json:"params,omitempty" jsonschema:"strategy params; omitted fields use defaults"`
+	Reason   string         `json:"reason" jsonschema:"evidence for this choice and what would make you switch"`
+}
+
+// SetStrategyOutput is the output of set_strategy.
+type SetStrategyOutput struct {
+	ActivationID int64  `json:"activation_id"`
+	Strategy     string `json:"strategy"`
+	Params       string `json:"params" jsonschema:"effective params including defaults"`
+	Note         string `json:"note"`
+}
+
+func (s *Server) setStrategy(ctx context.Context, _ *mcp.CallToolRequest, in SetStrategyInput) (*mcp.CallToolResult, SetStrategyOutput, error) {
+	params, err := rawParams(in.Params)
+	if err != nil {
+		return nil, SetStrategyOutput{}, err
+	}
+	a, err := strategy.Activate(ctx, s.cfg.Store, s.cfg.Tokens, in.Strategy, params, in.Reason, "agent", s.cfg.RunID,
+		s.cfg.Now().UTC(), false)
+	if err != nil {
+		return nil, SetStrategyOutput{}, err
+	}
+	return nil, SetStrategyOutput{ActivationID: a.ID, Strategy: a.Strategy, Params: a.Params,
+		Note: "live; it trades on the next tick (within a few minutes)"}, nil
+}
+
+func rawParams(m map[string]any) (json.RawMessage, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(m)
+}
+
+// ---- wallet & memory ---------------------------------------------------------------
 
 // BalancesOutput is the output of get_balances.
 type BalancesOutput struct {
@@ -297,35 +331,13 @@ type UpdateNarrativeInput struct {
 
 // UpdateNarrativeOutput is the output of update_narrative.
 type UpdateNarrativeOutput struct {
-	RunID    string   `json:"run_id"`
-	TradeIDs []string `json:"trade_ids" jsonschema:"trades from this run linked to the journal entry"`
-	Saved    bool     `json:"saved"`
+	RunID string `json:"run_id"`
+	Saved bool   `json:"saved"`
 }
 
 func (s *Server) updateNarrative(ctx context.Context, _ *mcp.CallToolRequest, in UpdateNarrativeInput) (*mcp.CallToolResult, UpdateNarrativeOutput, error) {
 	if err := s.cfg.Memory.Update(ctx, s.cfg.RunID, in.Narrative, in.Summary); err != nil {
 		return nil, UpdateNarrativeOutput{}, err
 	}
-	s.mu.Lock()
-	ids := append([]string{}, s.tradeIDs...)
-	s.mu.Unlock()
-	return nil, UpdateNarrativeOutput{RunID: s.cfg.RunID, TradeIDs: ids, Saved: true}, nil
-}
-
-// pruneLocked drops quotes past their TTL so the store doesn't grow unbounded.
-func (s *Server) pruneLocked() {
-	cutoff := s.now().Add(-s.cfg.QuoteTTL)
-	for id, q := range s.quotes {
-		if q.FetchedAt.Before(cutoff) {
-			delete(s.quotes, id)
-		}
-	}
-}
-
-func newQuoteID() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("generate quote id: %w", err)
-	}
-	return "q-" + hex.EncodeToString(b), nil
+	return nil, UpdateNarrativeOutput{RunID: s.cfg.RunID, Saved: true}, nil
 }

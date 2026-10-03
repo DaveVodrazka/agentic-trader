@@ -228,3 +228,171 @@ func must(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestPriceTicksBuildCandles(t *testing.T) {
+	s, ctx := open(t), context.Background()
+	iv := map[string]time.Duration{"1h": time.Hour, "5m": 5 * time.Minute}
+	base := t0.Add(10 * time.Minute) // 10:10
+	for i, p := range []float64{100, 104, 97, 101} {
+		must(t, s.AddPriceTicks(ctx, base.Add(time.Duration(i)*time.Minute), map[string]float64{"SOL": p}, iv, "test"))
+	}
+	c, _ := s.Candles(ctx, "SOL", "1h", t0, t0.Add(time.Hour))
+	if len(c) != 1 || c[0].Open != 100 || c[0].High != 104 || c[0].Low != 97 || c[0].Close != 101 || !c[0].Start.Equal(t0) {
+		t.Errorf("1h = %+v", c)
+	}
+	c, _ = s.Candles(ctx, "SOL", "5m", t0, t0.Add(time.Hour))
+	if len(c) != 1 || !c[0].Start.Equal(t0.Add(10*time.Minute)) {
+		t.Errorf("5m = %+v", c)
+	}
+
+	// Backfill replaces whole bars.
+	must(t, s.UpsertCandles(ctx, []Candle{{Symbol: "SOL", Interval: "1h", Start: t0, Open: 1, High: 2, Low: 0.5, Close: 1.5, Source: "bf"}}, ReplaceAll))
+	c, _ = s.Candles(ctx, "SOL", "1h", t0, t0.Add(time.Hour))
+	if c[0].Close != 1.5 || c[0].Source != "bf" {
+		t.Errorf("after upsert = %+v", c[0])
+	}
+}
+
+func TestStrategyActivations(t *testing.T) {
+	s, ctx := open(t), context.Background()
+	if _, ok, _ := s.LiveStrategy(ctx); ok {
+		t.Fatal("no strategy expected")
+	}
+	a1 := &Activation{Strategy: "cash", Params: "{}", Reason: "start", SetBy: "user", StartedAt: t0}
+	must(t, s.StartStrategy(ctx, a1))
+	a2 := &Activation{Strategy: "trend", Params: `{"fast":20}`, Reason: "trending", SetBy: "agent", RunID: "r1", StartedAt: t0.Add(time.Hour)}
+	must(t, s.StartStrategy(ctx, a2))
+
+	live, ok, err := s.LiveStrategy(ctx)
+	if err != nil || !ok || live.ID != a2.ID || live.Status != StatusActive || live.State != "{}" {
+		t.Fatalf("live = %+v ok=%v err=%v", live, ok, err)
+	}
+	all, _ := s.Activations(ctx, 0)
+	if len(all) != 2 || all[1].Status != StatusEnded || !all[1].EndedAt.Equal(a2.StartedAt) {
+		t.Errorf("activations = %+v", all)
+	}
+
+	must(t, s.SaveStrategyState(ctx, a2.ID, `{"x":1}`, ""))
+	must(t, s.SaveStrategyState(ctx, a2.ID, `{"x":2}`, "drawdown"))
+	live, _, _ = s.LiveStrategy(ctx)
+	if live.State != `{"x":2}` || live.Status != StatusHalted || live.HaltReason != "drawdown" {
+		t.Errorf("halted = %+v", live)
+	}
+
+	must(t, s.RecordTick(ctx, Tick{ActivationID: a2.ID, At: t0, ValueUSDC: "1000", Targets: "{}", Actions: "[]", Note: "n"}))
+	ticks, _ := s.RecentTicks(ctx, a2.ID, 5)
+	if len(ticks) != 1 || ticks[0].Note != "n" {
+		t.Errorf("ticks = %+v", ticks)
+	}
+
+	must(t, s.AddDeposit(ctx, Deposit{At: t0, Symbol: "USDC", Amount: big.NewInt(100e6), ValueUSDC: "100"}))
+	must(t, s.RecordTrade(ctx, &Trade{ID: "t1", At: t0, From: "USDC", To: "SOL", InAmount: big.NewInt(1e6), OutAmount: big.NewInt(1), ActivationID: a2.ID}))
+	trades, _ := s.Trades(ctx)
+	if trades[0].ActivationID != a2.ID {
+		t.Errorf("trade activation = %d", trades[0].ActivationID)
+	}
+}
+
+func TestCandleWriteModes(t *testing.T) {
+	s, ctx := open(t), context.Background()
+	tick := Candle{Symbol: "SOL", Interval: "1h", Start: t0, Open: 1, High: 1, Low: 1, Close: 1, Source: "jupiter"}
+	gecko := Candle{Symbol: "SOL", Interval: "1h", Start: t0.Add(time.Hour), Open: 2, High: 2, Low: 2, Close: 2, Source: "gt"}
+	must(t, s.UpsertCandles(ctx, []Candle{tick, gecko}, InsertMissing))
+
+	tick2, gecko2 := tick, gecko
+	tick2.Close, tick2.Source = 9, "gt"
+	gecko2.Close = 3
+	must(t, s.UpsertCandles(ctx, []Candle{tick2, gecko2}, ReplaceSameSource))
+	cs, _ := s.Candles(ctx, "SOL", "1h", t0, t0.Add(2*time.Hour))
+	if cs[0].Close != 1 || cs[0].Source != "jupiter" || cs[1].Close != 3 {
+		t.Errorf("same-source = %+v", cs)
+	}
+	must(t, s.UpsertCandles(ctx, []Candle{tick2}, InsertMissing))
+	if cs, _ := s.Candles(ctx, "SOL", "1h", t0, t0.Add(time.Hour)); cs[0].Close != 1 {
+		t.Errorf("insert-missing overwrote: %+v", cs)
+	}
+	must(t, s.UpsertCandles(ctx, []Candle{tick2}, ReplaceAll))
+	if cs, _ := s.Candles(ctx, "SOL", "1h", t0, t0.Add(time.Hour)); cs[0].Close != 9 {
+		t.Errorf("replace-all = %+v", cs)
+	}
+
+	starts, _ := s.CandleStarts(ctx, "SOL", "1h", t0.Add(time.Hour))
+	if len(starts) != 1 || !starts[0].Equal(t0.Add(time.Hour)) {
+		t.Errorf("starts = %v", starts)
+	}
+	if e, ok, _ := s.EarliestCandle(ctx, "SOL", "1h"); !ok || !e.Equal(t0) {
+		t.Errorf("earliest = %v %v", e, ok)
+	}
+
+	if _, ok, _ := s.GetBackfillState(ctx, "SOL", "1h"); ok {
+		t.Error("unexpected state")
+	}
+	b := BackfillState{Symbol: "SOL", Interval: "1h", Provider: "gt", Pool: "p", PoolName: "SOL / USDC", Earliest: t0}
+	must(t, s.SaveBackfillState(ctx, b, t0))
+	b.CheckedThrough = t0.Add(5 * time.Hour)
+	must(t, s.SaveBackfillState(ctx, b, t0))
+	got, ok, _ := s.GetBackfillState(ctx, "SOL", "1h")
+	if !ok || got.Pool != "p" || !got.Earliest.Equal(t0) || !got.CheckedThrough.Equal(b.CheckedThrough) {
+		t.Errorf("state = %+v", got)
+	}
+}
+
+func TestWakeups(t *testing.T) {
+	s, ctx := open(t), context.Background()
+	w := Wakeup{At: t0, Kind: "move", Key: "move:SOL", Detail: "SOL -6% in 1h"}
+	if added, err := s.AddWakeup(ctx, w, time.Hour); err != nil || !added {
+		t.Fatalf("added=%v err=%v", added, err)
+	}
+	w.At = t0.Add(30 * time.Minute)
+	if added, _ := s.AddWakeup(ctx, w, time.Hour); added {
+		t.Error("debounce failed")
+	}
+	w.At = t0.Add(61 * time.Minute)
+	if added, _ := s.AddWakeup(ctx, w, time.Hour); !added {
+		t.Error("cooldown should have expired")
+	}
+	must(t, s.BeginRun(ctx, "r1", "", t0.Add(2*time.Hour)))
+	got, err := s.ClaimWakeups(ctx, "r1", t0.Add(2*time.Hour))
+	if err != nil || len(got) != 2 || got[0].Detail != "SOL -6% in 1h" {
+		t.Fatalf("claimed = %+v err=%v", got, err)
+	}
+	if again, _ := s.ClaimWakeups(ctx, "r2", t0.Add(3*time.Hour)); len(again) != 0 {
+		t.Errorf("claimed twice: %+v", again)
+	}
+	if at, ok, _ := s.LastRunStart(ctx); !ok || !at.Equal(t0.Add(2*time.Hour)) {
+		t.Errorf("last run = %v %v", at, ok)
+	}
+}
+
+// Several processes opening a new database at once (e.g. the tick and agent
+// jobs starting together) must not race on migrations.
+func TestConcurrentOpenMigratesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "race.db")
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := Open(path) // separate *sql.DB, like a separate process
+			if err != nil {
+				errs <- err
+				return
+			}
+			s.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	s, err := Open(path)
+	must(t, err)
+	defer s.Close()
+	var v int
+	s.db.QueryRow(`PRAGMA user_version`).Scan(&v)
+	if v != len(migrations) {
+		t.Errorf("version = %d", v)
+	}
+}
