@@ -38,6 +38,7 @@ var commands = []command{
 	{"strategy", "list | show | history | set <name> -reason ...", runStrategy},
 	{"backtest", "backtest <name> [-params JSON] [-days N] vs benchmarks", runBacktest},
 	{"backfill", "load historical price bars (GeckoTerminal)", runBackfill},
+	{"serve", "serve the local dashboard (default http://127.0.0.1:8080)", runServe},
 	{"pnl", "print the profit & loss report", noArgs(cmdPnL)},
 	{"narrative", "print the latest narrative", noArgs(cmdNarrative)},
 	{"journal", "print the journal", noArgs(cmdJournal)},

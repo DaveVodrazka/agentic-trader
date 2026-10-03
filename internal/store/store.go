@@ -445,6 +445,36 @@ func (s *Store) CountRuns(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// Runs returns the last limit runs, newest first.
+func (s *Store) Runs(ctx context.Context, limit int) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, started_at, coalesce(finished_at,''), exit_code,
+			coalesce(prompt,''), coalesce(report,''), coalesce(log_path,'')
+		FROM runs ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		var r Run
+		var started, finished string
+		var code sql.NullInt64
+		if err := rows.Scan(&r.ID, &started, &finished, &code, &r.Prompt, &r.Report, &r.LogPath); err != nil {
+			return nil, err
+		}
+		r.StartedAt = parseTS(started)
+		if finished != "" {
+			r.FinishedAt = parseTS(finished)
+		}
+		if code.Valid {
+			c := int(code.Int64)
+			r.ExitCode = &c
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ---- journal & narratives --------------------------------------------------
 
 // JournalEntry is the agent's summary of one run.

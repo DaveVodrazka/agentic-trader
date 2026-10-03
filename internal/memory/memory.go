@@ -111,13 +111,16 @@ func (m *Memory) writeView(n store.Narrative) error {
 
 // Context renders the block given to the agent at the start of a run: why
 // it is running (wake-ups, if any), its narrative and recent journal.
-func (m *Memory) Context(ctx context.Context, runID string, wakeups []store.Wakeup) (string, error) {
+func (m *Memory) Context(ctx context.Context, runID string, requested bool, wakeups []store.Wakeup) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Context\n\nCurrent time: %s\nRun ID: %s\n\n## Why you are running now\n",
 		m.now().UTC().Format(time.RFC3339), runID)
-	if len(wakeups) == 0 {
+	if requested {
+		b.WriteString("Review requested by the owner: review the live strategy properly (as when woken early).\n")
+	}
+	if len(wakeups) == 0 && !requested {
 		b.WriteString("Routine hourly review.\n")
-	} else {
+	} else if len(wakeups) > 0 {
 		b.WriteString("Woken early by market events:\n")
 		for _, w := range wakeups {
 			fmt.Fprintf(&b, "- %s %s\n", w.At.UTC().Format("15:04Z"), w.Detail)

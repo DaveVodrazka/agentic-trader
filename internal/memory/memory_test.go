@@ -61,7 +61,7 @@ func TestUpdateStoresAndWritesView(t *testing.T) {
 		t.Errorf("journal = %+v", j)
 	}
 
-	c, err := m.Context(ctx, "run-3", []store.Wakeup{{At: time.Now(), Detail: "SOL -6.0% in the last hour"}})
+	c, err := m.Context(ctx, "run-3", false, []store.Wakeup{{At: time.Now(), Detail: "SOL -6.0% in the last hour"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,8 +74,16 @@ func TestUpdateStoresAndWritesView(t *testing.T) {
 
 func TestContextFirstRun(t *testing.T) {
 	m, _, _ := newMemory(t)
-	c, err := m.Context(context.Background(), "run-1", nil)
+	c, err := m.Context(context.Background(), "run-1", false, nil)
 	if err != nil || !strings.Contains(c, "first run") || !strings.Contains(c, "(empty)") || !strings.Contains(c, "Routine hourly review") {
+		t.Errorf("context = %q, err = %v", c, err)
+	}
+}
+
+func TestContextRequested(t *testing.T) {
+	m, _, _ := newMemory(t)
+	c, err := m.Context(context.Background(), "run-1", true, nil)
+	if err != nil || !strings.Contains(c, "requested by the owner") || strings.Contains(c, "Routine hourly review") {
 		t.Errorf("context = %q, err = %v", c, err)
 	}
 }

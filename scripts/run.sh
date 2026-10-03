@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Runs one portfolio review by the agent, with its memory loaded.
-# Usage: scripts/run.sh ["optional prompt"]
+# Usage: scripts/run.sh [--requested] ["optional prompt"]
+#   --requested  the owner asked for this review: the agent reviews in full
+#
+# Only one review runs at a time: if another is running, this exits 75.
 #
 # Env:
 #   TRADER_TIMEOUT   max seconds per cycle before it is killed (default 600)
@@ -22,14 +25,37 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+requested=false
+default_prompt="Run your portfolio review."
+if [[ "${1:-}" == "--requested" ]]; then
+  requested=true
+  default_prompt="Review the live strategy (requested by the owner)."
+  shift
+fi
+
 export TRADER_RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)"
-PROMPT="${1:-Run your portfolio review.}"
+PROMPT="${1:-$default_prompt}"
 TIMEOUT="${TRADER_TIMEOUT:-600}"
 mkdir -p logs
 LOG="logs/${TRADER_RUN_ID}.log"
 
+# One review at a time. The lock holds our PID so a crashed run's lock is
+# taken over; the web UI reads it to show a review in progress.
+LOCK="logs/agent.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  pid="$(cat "$LOCK/pid" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "another agent review is running (pid $pid); skipping" >&2
+    exit 75
+  fi
+  rm -rf "$LOCK"
+  mkdir "$LOCK"
+fi
+echo $$ >"$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
+
 # Records the run start and returns the agent's memory (narrative + journal).
-memory="$("$BIN" -db "$DB" begin-run -run-id "$TRADER_RUN_ID" -prompt "$PROMPT")"
+memory="$("$BIN" -db "$DB" begin-run -run-id "$TRADER_RUN_ID" -prompt "$PROMPT" -requested="$requested")"
 
 mcp_config=$(jq -n --arg bin "$BIN" --arg db "$DB" \
   '{mcpServers: {trader: {command: $bin, args: ["-db", $db, "mcp"]}}}')

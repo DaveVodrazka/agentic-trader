@@ -20,6 +20,7 @@ func runBeginRun(ctx context.Context, app *app, args []string) error {
 	fs := flag.NewFlagSet("begin-run", flag.ExitOnError)
 	runID := fs.String("run-id", "", "run ID (required)")
 	prompt := fs.String("prompt", "", "the prompt given to the agent")
+	requested := fs.Bool("requested", false, "the owner asked for this review (a full one)")
 	fs.Parse(args)
 	if *runID == "" {
 		return errors.New("-run-id is required")
@@ -35,7 +36,7 @@ func runBeginRun(ctx context.Context, app *app, args []string) error {
 	if err != nil {
 		return err
 	}
-	block, err := app.memory().Context(ctx, *runID, wakeups)
+	block, err := app.memory().Context(ctx, *runID, *requested, wakeups)
 	if err != nil {
 		return err
 	}

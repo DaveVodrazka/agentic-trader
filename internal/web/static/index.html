@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic Trader</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M1 12l4-4 3 3 6-7' fill='none' stroke='%2316a34a' stroke-width='2'/></svg>">
+<style>
+:root {
+  --bg: #f6f7f9; --card: #fff; --text: #16181d; --muted: #6b7280; --line: #e5e7eb;
+  --accent: #2563eb; --up: #15803d; --down: #b91c1c; --warn: #b45309; --chip: #f1f3f6;
+  --sel: #eef4ff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --card: #171a21; --text: #e6e8ec; --muted: #8b93a1; --line: #262b35;
+    --accent: #60a5fa; --up: #4ade80; --down: #f87171; --warn: #fbbf24; --chip: #222733;
+    --sel: #1c2a44;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--card);
+  position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 17px; margin: 0; margin-right: auto; }
+main { max-width: 1280px; margin: 0 auto; padding: 16px 20px 40px; }
+button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  padding: 7px 12px; border-radius: 7px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.small { padding: 3px 8px; font-size: 12px; }
+.pill { font-size: 12px; padding: 3px 10px; border-radius: 99px; background: var(--chip); color: var(--muted); }
+.pill.live { color: var(--accent); }
+.pill.live::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px;
+  border-radius: 50%; background: var(--accent); animation: pulse 1.2s infinite; vertical-align: 1px; }
+@keyframes pulse { 50% { opacity: .25; } }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.stat, .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+.stat { padding: 12px 14px; }
+.stat .label { color: var(--muted); font-size: 12px; }
+.stat .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.stat .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.asof { color: var(--muted); font-size: 12px; margin: 8px 2px 16px; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.col { display: grid; gap: 16px; min-width: 0; }
+@media (max-width: 980px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.card { padding: 14px 16px; min-width: 0; }
+.card h2 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+.card h2 .right { margin-left: auto; display: flex; gap: 6px; font-weight: normal; }
+.muted { color: var(--muted); }
+.up { color: var(--up); } .down { color: var(--down); } .warn { color: var(--warn); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; }
+th, td { padding: 6px 6px; border-bottom: 1px solid var(--line); }
+td.num, th.num { text-align: right; }
+tbody tr:last-child td { border-bottom: none; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--chip); }
+tr.sel td { background: var(--sel); }
+.tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.tabs button { border: none; border-radius: 0; padding: 3px 10px; font-size: 12px; }
+.tabs button.on { background: var(--chip); font-weight: 600; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-variant-numeric: tabular-nums; }
+.kv dt { color: var(--muted); } .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { background: var(--chip); border-radius: 6px; padding: 2px 8px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+.badge { font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--chip); font-weight: 500; }
+.badge.active { color: var(--up); } .badge.halted { color: var(--down); }
+.scroll { max-height: 340px; overflow: auto; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 ui-monospace, Menlo, monospace;
+  background: var(--chip); padding: 10px; border-radius: 7px; margin: 8px 0 0; max-height: 420px; overflow: auto; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.md h1, .md h2, .md h3 { font-size: 14px; margin: 14px 0 4px; }
+.md > :first-child { margin-top: 0; }
+.md p { margin: 6px 0; } .md ul, .md ol { margin: 4px 0; padding-left: 20px; }
+.md code { background: var(--chip); padding: 0 4px; border-radius: 4px; font-size: 12px; }
+.md table { margin: 8px 0; font-size: 13px; }
+.md hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+.md pre { margin: 8px 0; }
+.tablewrap { overflow-x: auto; }
+.report { background: var(--chip); border-radius: 7px; padding: 10px 12px; margin-top: 8px; }
+.report table th, .report table td { border-bottom-color: var(--line); }
+.meta { color: var(--muted); font: 11px/1.5 ui-monospace, Menlo, monospace; margin-top: 6px; }
+#chart { width: 100%; height: 220px; display: block; }
+#chart .line { fill: none; stroke: var(--accent); stroke-width: 1.8; }
+#chart .area { fill: var(--accent); opacity: .08; }
+#chart .base { stroke: var(--muted); stroke-dasharray: 4 4; stroke-width: 1; }
+#chart .axis { fill: var(--muted); font-size: 11px; }
+#chart .grid { stroke: var(--line); stroke-width: 1; }
+#chart .dot { fill: var(--card); stroke: var(--accent); stroke-width: 1.5; cursor: pointer; }
+#chart .dot.manual { fill: var(--accent); }
+#chart .dot.sel { r: 5; stroke-width: 2.5; }
+.chart-wrap { position: relative; }
+#tip { position: absolute; pointer-events: none; background: var(--card); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; display: none; white-space: nowrap; box-shadow: 0 2px 8px #0002; }
+#toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+  padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 10; max-width: 90vw; }
+#toast.show { opacity: 1; }
+.run { border-bottom: 1px solid var(--line); padding: 8px 0; }
+.run:last-child { border-bottom: none; }
+.empty { color: var(--muted); padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agentic Trader</h1>
+  <span id="reviewPill" class="pill">agent idle</span>
+  <button id="snapBtn">Take PnL snapshot</button>
+  <button id="reviewBtn" class="primary">Request strategy review</button>
+</header>
+
+<main>
+  <section class="stats" id="stats"></section>
+  <div class="asof" id="asof"></div>
+
+  <section class="card" style="margin-bottom:16px">
+    <h2>Portfolio value <span class="right muted" id="chartNote"></span></h2>
+    <div class="chart-wrap"><svg id="chart"></svg><div id="tip"></div></div>
+  </section>
+
+  <div class="grid">
+    <div class="col">
+      <section class="card">
+        <h2>PnL snapshots
+          <span class="right"><span class="tabs" id="kindTabs">
+            <button data-kind="all" class="on">All</button><button data-kind="manual,initial">Manual</button><button data-kind="run">Agent runs</button>
+          </span></span>
+        </h2>
+        <div class="scroll"><table>
+          <thead><tr><th>#</th><th>Taken</th><th>Kind</th><th class="num">Value</th><th class="num">PnL</th><th class="num">Δ prev</th></tr></thead>
+          <tbody id="snapRows"></tbody>
+        </table></div>
+        <div style="margin-top:8px"><button id="moreBtn" class="small" hidden>Load older</button></div>
+      </section>
+
+      <section class="card" id="detail"></section>
+    </div>
+
+    <div class="col">
+      <section class="card" id="strategy"></section>
+      <section class="card" id="reviews"></section>
+      <section class="card" id="narrative"></section>
+    </div>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = { kind: "all", snaps: [], more: false, selected: null, equity: [], running: false, lastRunId: null };
+
+// ---- formatting ---------------------------------------------------------------
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (s) => (s === "" || s == null ? NaN : Number(s));
+function usd(v, digits = 2) {
+  const n = num(v);
+  if (isNaN(n)) return "—";
+  return (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function signedUsd(v) { const n = num(v); return isNaN(n) ? "—" : (n > 0 ? "+" : "") + usd(n); }
+function pct(v, digits = 2) { const n = num(v); return isNaN(n) ? "—" : (n > 0 ? "+" : "") + n.toFixed(digits) + "%"; }
+const cls = (v) => (num(v) > 0 ? "up" : num(v) < 0 ? "down" : "");
+function price(v) {
+  const n = num(v);
+  if (isNaN(n)) return "—";
+  return "$" + n.toLocaleString(undefined, { maximumSignificantDigits: n >= 1 ? 6 : 4, maximumFractionDigits: n >= 1 ? 2 : 10 });
+}
+function amount(s) {
+  const n = num(s);
+  return isNaN(n) ? esc(s) : n.toLocaleString(undefined, { maximumFractionDigits: n >= 100 ? 2 : 6 });
+}
+function when(t) {
+  if (!t) return "—";
+  const d = new Date(t);
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+function ago(t) {
+  const s = (Date.now() - new Date(t)) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+// Go durations ("26h3m0s") to "1d 2h 3m".
+function dur(s) {
+  if (!s) return "";
+  const h = +(s.match(/(\d+)h/) || [0, 0])[1], m = +(s.match(/(\d+)m(?!s)/) || [0, 0])[1];
+  const d = Math.floor(h / 24), hh = h % 24;
+  return [d && d + "d", hh && hh + "h", (m || (!d && !hh)) && m + "m"].filter(Boolean).join(" ");
+}
+const kindLabel = { initial: "initial", manual: "manual", run: "agent run" };
+
+// Minimal Markdown: headings, lists, tables, code blocks, rules, bold,
+// italics, inline code, paragraphs. Everything is escaped first.
+function markdown(src) {
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])[*_]([^*_\s][^*_]*?)[*_](?=[\s.,;:!?)]|$)/g, "$1<em>$2</em>");
+  const cells = (row) => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  const lines = src.split("\n");
+  let html = "", list = null, para = [];
+  const flushPara = () => { if (para.length) { html += "<p>" + para.map(inline).join(" ") + "</p>"; para = []; } };
+  const flushList = () => { if (list) { html += `</${list}>`; list = null; } };
+  const flush = () => { flushPara(); flushList(); };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trimEnd();
+    let m;
+    if (/^```/.test(line)) {
+      flush();
+      const code = [];
+      while (++i < lines.length && !/^```/.test(lines[i])) code.push(lines[i]);
+      html += `<pre>${esc(code.join("\n"))}</pre>`;
+    } else if (/^\s*\|/.test(line) && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1] || "")) {
+      flush();
+      const head = cells(line), aligns = cells(lines[++i]).map((c) => (/-:$/.test(c) ? "num" : ""));
+      html += `<div class="tablewrap"><table><thead><tr>${head.map((c, j) => `<th class="${aligns[j] || ""}">${inline(c)}</th>`).join("")}</tr></thead><tbody>`;
+      while (i + 1 < lines.length && /^\s*\|/.test(lines[i + 1]))
+        html += "<tr>" + cells(lines[++i]).map((c, j) => `<td class="${aligns[j] || ""}">${inline(c)}</td>`).join("") + "</tr>";
+      html += "</tbody></table></div>";
+    } else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); html += "<hr>"; }
+    else if ((m = line.match(/^\*\*([^*]+)\*\*:?$/))) { flush(); html += `<h3>${inline(m[1])}</h3>`; } // a bold line is a title
+    else if ((m = line.match(/^(#{1,6})\s+(.*)/))) { flush(); const l = Math.min(m[1].length + 1, 3); html += `<h${l}>${inline(m[2])}</h${l}>`; }
+    else if ((m = line.match(/^\s*[-*+]\s+(.*)/)) || (m = line.match(/^\s*\d+[.)]\s+(.*)/))) {
+      flushPara();
+      const type = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (list !== type) { flushList(); html += `<${type}>`; list = type; }
+      html += "<li>" + inline(m[1]) + "</li>";
+    } else if (!line.trim()) { flush(); }
+    else if (list && /^\s{2,}\S/.test(lines[i])) { html = html.replace(/<\/li>$/, " " + inline(line.trim()) + "</li>"); }
+    else { flushList(); para.push(line.trim()); }
+  }
+  flush();
+  return html;
+}
+
+// An agent run log: "== ..." bookkeeping lines and the end-run snapshot line
+// become a footer; the rest is the agent's Markdown report.
+function report(log) {
+  const meta = [], body = [];
+  for (const line of log.split("\n")) (/^== |^snapshot #\d+:/.test(line) ? meta : body).push(line);
+  return `<div class="md report">${markdown(body.join("\n").trim())}</div>` +
+    (meta.length ? `<div class="meta">${meta.map((l) => esc(l.replace(/^== /, ""))).join("<br>")}</div>` : "");
+}
+
+// ---- API ----------------------------------------------------------------------
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { "X-Trader": "1", ...(opts.headers || {}) } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(body.error || res.statusText), { status: res.status });
+  return body;
+}
+let toastTimer;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 3500);
+}
+
+// ---- latest PnL -----------------------------------------------------------------
+function renderStats(s) {
+  if (!s) { $("stats").innerHTML = `<div class="stat"><div class="label">No snapshots yet</div></div>`; return; }
+  const tiles = [
+    ["Portfolio value", usd(s.value_usdc), `deposited ${usd(s.deposits_usdc)}`],
+    ["PnL", `<span class="${cls(s.pnl_usdc)}">${signedUsd(s.pnl_usdc)}</span>`, `<span class="${cls(s.return_pct)}">${pct(s.return_pct)}</span>`],
+    ["APR (simple)", `<span class="${cls(s.apr_pct)}">${pct(s.apr_pct, 1)}</span>`, `APY ${pct(s.apy_pct, 1)}`],
+    ["Costs", usd(s.costs_usdc, num(s.costs_usdc) < 1 ? 4 : 2), `gross PnL ${signedUsd(s.gross_pnl_usdc)}`],
+    ["Cash (USDC)", pct(s.cash_pct, 1).replace("+", ""), `${s.trades} trades · ${s.runs} agent runs`],
+  ];
+  $("stats").innerHTML = tiles.map(([l, v, sub]) =>
+    `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${sub}</div></div>`).join("");
+  $("asof").innerHTML = `Latest snapshot #${s.id} · ${kindLabel[s.kind] || s.kind} · ${when(s.taken_at)} (${ago(s.taken_at)})` +
+    (s.complete ? "" : ` · <span class="warn">incomplete: some holdings could not be priced</span>`);
+}
+
+// ---- chart ----------------------------------------------------------------------
+function renderChart() {
+  const svg = $("chart"), pts = state.equity;
+  const W = svg.clientWidth || 800, H = 220, L = 72, R = 12, T = 12, B = 24;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  if (pts.length < 2) { svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle" class="axis">Not enough snapshots yet</text>`; return; }
+  const xs = pts.map((p) => +new Date(p.taken_at)), ys = pts.map((p) => num(p.value_usdc));
+  const base = num(pts[pts.length - 1].value_usdc) - num(pts[pts.length - 1].pnl_usdc); // deposits
+  let lo = Math.min(...ys, base), hi = Math.max(...ys, base);
+  const pad = (hi - lo) * 0.1 || hi * 0.01 || 1; lo -= pad; hi += pad;
+  const x0 = xs[0], x1 = xs[xs.length - 1] === x0 ? x0 + 1 : xs[xs.length - 1];
+  const X = (x) => L + ((x - x0) / (x1 - x0)) * (W - L - R), Y = (y) => T + (1 - (y - lo) / (hi - lo)) * (H - T - B);
+  let out = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + ((hi - lo) * i) / 4, y = Y(v);
+    out += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y}" y2="${y}"/><text class="axis" x="${L - 6}" y="${y + 4}" text-anchor="end">${usd(v, hi - lo < 20 ? 2 : 0)}</text>`;
+  }
+  for (let i = 0; i <= 3; i++) {
+    const t = x0 + ((x1 - x0) * i) / 3;
+    out += `<text class="axis" x="${X(t)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 3 ? "end" : "middle"}">${when(t)}</text>`;
+  }
+  out += `<line class="base" x1="${L}" x2="${W - R}" y1="${Y(base)}" y2="${Y(base)}"/>`;
+  const path = pts.map((p, i) => `${i ? "L" : "M"}${X(xs[i]).toFixed(1)},${Y(ys[i]).toFixed(1)}`).join("");
+  out += `<path class="area" d="${path}L${X(x1)},${H - B}L${L},${H - B}Z"/><path class="line" d="${path}"/>`;
+  const showDots = pts.length <= 300;
+  pts.forEach((p, i) => {
+    const sel = p.id === state.selected;
+    if (showDots || sel || p.kind !== "run")
+      out += `<circle class="dot ${p.kind}${sel ? " sel" : ""}" data-i="${i}" cx="${X(xs[i])}" cy="${Y(ys[i])}" r="3.2"/>`;
+  });
+  svg.innerHTML = out;
+  $("chartNote").textContent = `${pts.length} snapshots · dashed line = deposits · filled dots = manual`;
+}
+function chartEvents() {
+  const svg = $("chart"), tip = $("tip");
+  svg.addEventListener("mousemove", (e) => {
+    const d = e.target.closest(".dot");
+    if (!d) { tip.style.display = "none"; return; }
+    const p = state.equity[+d.dataset.i];
+    tip.innerHTML = `#${p.id} · ${when(p.taken_at)}<br><b>${usd(p.value_usdc)}</b> <span class="${cls(p.pnl_usdc)}">${signedUsd(p.pnl_usdc)}</span>`;
+    const r = svg.getBoundingClientRect();
+    tip.style.display = "block";
+    tip.style.left = Math.min(e.clientX - r.left + 10, r.width - tip.offsetWidth) + "px";
+    tip.style.top = e.clientY - r.top - 44 + "px";
+  });
+  svg.addEventListener("mouseleave", () => (tip.style.display = "none"));
+  svg.addEventListener("click", (e) => { const d = e.target.closest(".dot"); if (d) selectSnapshot(state.equity[+d.dataset.i].id); });
+  window.addEventListener("resize", renderChart);
+}
+
+// ---- snapshot list and detail -----------------------------------------------
+async function loadSnapshots(append = false) {
+  const before = append && state.snaps.length ? state.snaps[state.snaps.length - 1].id : 0;
+  const r = await api(`/api/snapshots?kind=${state.kind}&limit=50${before ? "&before=" + before : ""}`);
+  state.snaps = append ? state.snaps.concat(r.snapshots) : r.snapshots;
+  state.more = r.more;
+  renderSnapshotRows();
+}
+function renderSnapshotRows() {
+  const rows = state.snaps.map((s, i) => {
+    const prev = state.snaps[i + 1];
+    const delta = prev ? num(s.value_usdc) - num(prev.value_usdc) : NaN;
+    return `<tr class="click${s.id === state.selected ? " sel" : ""}" data-id="${s.id}">
+      <td class="muted">${s.id}</td><td>${when(s.taken_at)}</td><td>${kindLabel[s.kind] || esc(s.kind)}${s.complete ? "" : ' <span class="warn" title="incomplete">⚠</span>'}</td>
+      <td class="num">${usd(s.value_usdc)}</td><td class="num ${cls(s.pnl_usdc)}">${signedUsd(s.pnl_usdc)}</td>
+      <td class="num ${cls(delta)}">${isNaN(delta) ? "" : signedUsd(delta)}</td></tr>`;
+  });
+  $("snapRows").innerHTML = rows.join("") || `<tr><td colspan="6" class="empty">No snapshots.</td></tr>`;
+  $("moreBtn").hidden = !state.more;
+}
+async function selectSnapshot(id) {
+  state.selected = id;
+  renderSnapshotRows(); renderChart();
+  try { renderDetail(await api(`/api/snapshots/${id}?kind=${state.kind}`)); }
+  catch (e) { $("detail").innerHTML = `<h2>Snapshot</h2><div class="down">${esc(e.message)}</div>`; }
+}
+function renderDetail(s) {
+  const holdings = (s.holdings || []).map((h) => `<tr><td><b>${esc(h.symbol)}</b></td><td class="num">${amount(h.amount)}</td>
+    <td class="num">${h.price_usdc ? price(h.price_usdc) : ""}</td>
+    <td class="num">${h.error ? `<span class="warn" title="${esc(h.error)}">unpriced</span>` : usd(h.value_usdc)}</td>
+    <td class="num">${h.weight_pct ? num(h.weight_pct).toFixed(1) + "%" : ""}</td></tr>`).join("");
+  $("detail").innerHTML = `
+    <h2>Snapshot #${s.id} <span class="badge">${kindLabel[s.kind] || esc(s.kind)}</span>
+      <span class="right"><button class="small" data-go="${s.prev_id || ""}" ${s.prev_id ? "" : "disabled"}>← Older</button>
+      <button class="small" data-go="${s.next_id || ""}" ${s.next_id ? "" : "disabled"}>Newer →</button></span></h2>
+    <dl class="kv">
+      <dt>Taken</dt><dd>${new Date(s.taken_at).toLocaleString()}${s.run_id ? ` · ${esc(s.run_id)}` : ""}</dd>
+      <dt>Value</dt><dd><b>${usd(s.value_usdc)}</b>${s.complete ? "" : ' <span class="warn">incomplete</span>'}</dd>
+      <dt>PnL</dt><dd class="${cls(s.pnl_usdc)}">${signedUsd(s.pnl_usdc)} (${pct(s.return_pct)})</dd>
+      <dt>Gross PnL</dt><dd>${signedUsd(s.gross_pnl_usdc)} before ${usd(s.costs_usdc, 4)} costs (${esc(s.network_fees_sol)} SOL network fees)</dd>
+      <dt>APR / APY</dt><dd>${pct(s.apr_pct, 1)} / ${pct(s.apy_pct, 1)}</dd>
+      <dt>Activity</dt><dd>${s.trades} trades · ${s.runs} agent runs · ${num(s.cash_pct).toFixed(1)}% cash</dd>
+    </dl>
+    <table style="margin-top:12px"><thead><tr><th>Token</th><th class="num">Amount</th><th class="num">Price</th><th class="num">Value</th><th class="num">Weight</th></tr></thead>
+    <tbody>${holdings || '<tr><td colspan="5" class="empty">No holdings.</td></tr>'}</tbody></table>`;
+}
+
+// ---- strategy -----------------------------------------------------------------
+function renderStrategy(r) {
+  const el = $("strategy");
+  if (!r.live) { el.innerHTML = `<h2>Strategy</h2><div class="empty">No strategy is live; nothing trades.</div>`; return; }
+  const p = r.performance;
+  const params = Object.entries(JSON.parse(p.params || "{}")).map(([k, v]) =>
+    `<span class="chip">${esc(k)}=${esc(typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
+  const bench = (p.benchmarks_same_window || []).map((b) =>
+    `<tr><td>${esc(b.label)}</td><td class="num ${cls(b.return_pct)}">${pct(b.return_pct)}</td><td class="num">${num(b.max_drawdown_pct).toFixed(2)}%</td></tr>`).join("");
+  const entries = Object.entries(p.entry_prices || {}).map(([k, v]) => `<span class="chip">${esc(k)} ${price(v)}</span>`).join("");
+  const ticks = (r.recent_ticks || []).map((t) => `<tr><td>${when(t.at)}</td><td class="num">${usd(t.value_usdc)}</td>
+    <td>${Object.entries(t.targets || {}).map(([k, v]) => `${esc(k)} ${(v * 100).toFixed(0)}%`).join(", ") || "cash"}</td>
+    <td>${(t.actions || []).length ? t.actions.map((a) => esc(`${a.from}→${a.to} ${a.all ? "all" : "$" + (a.value_usd ?? 0).toFixed(2)}${a.error ? " ✗ " + a.error : ""}`)).join("<br>") : '<span class="muted">—</span>'}</td></tr>`).join("");
+  const hist = (r.history || []).map((a) => `<tr><td class="muted">#${a.id}</td><td><b>${esc(a.strategy)}</b> <span class="badge ${esc(a.status)}">${esc(a.status)}</span></td>
+    <td>${when(a.started_at)}${a.ended_at ? " → " + when(a.ended_at) : " → now"}</td><td class="muted">${esc(a.set_by)}</td></tr>
+    <tr><td></td><td colspan="3" class="muted" style="font-size:12px">${esc(a.reason)}${a.halt_reason ? ` · <span class="down">${esc(a.halt_reason)}</span>` : ""}</td></tr>`).join("");
+  el.innerHTML = `
+    <h2>Strategy: ${esc(p.strategy)} <span class="badge ${esc(p.status)}">${esc(p.status)}</span><span class="right muted">#${p.activation_id}</span></h2>
+    <div class="chips" style="margin-bottom:10px">${params || '<span class="muted">default params</span>'}</div>
+    <dl class="kv">
+      <dt>Running for</dt><dd>${dur(p.running_for)} (since ${when(p.since)})${p.can_switch_in ? ` · <span class="muted">can switch in ${dur(p.can_switch_in)}</span>` : ""}</dd>
+      ${p.halt_reason ? `<dt>Halted</dt><dd class="down">${esc(p.halt_reason)}</dd>` : ""}
+      <dt>Return</dt><dd class="${cls(p.return_pct)}">${p.return_pct ? pct(p.return_pct, 1) : "—"} <span class="muted">(${usd(p.start_value_usd)} → ${usd(p.current_value_usd)}, ${p.ticks} ticks)</span></dd>
+      <dt>Trades</dt><dd>${p.trades} · costs ${usd(p.costs_usd)}</dd>
+      ${entries ? `<dt>Entry prices</dt><dd class="chips">${entries}</dd>` : ""}
+      ${(p.stopped_out || []).length ? `<dt>Stopped out</dt><dd class="down">${p.stopped_out.map(esc).join(", ")}</dd>` : ""}
+      <dt>Last decision</dt><dd class="muted">${esc(p.last_decision || "—")}</dd>
+      <dt>Why</dt><dd>${esc(p.reason)}</dd>
+    </dl>
+    ${bench ? `<table style="margin-top:12px"><thead><tr><th>Benchmark (same window)</th><th class="num">Return</th><th class="num">Max DD</th></tr></thead><tbody>
+      <tr><td><b>${esc(p.strategy)} (live)</b></td><td class="num ${cls(p.return_pct)}">${p.return_pct ? pct(p.return_pct, 1) : "—"}</td><td></td></tr>${bench}</tbody></table>`
+      : '<div class="muted" style="margin-top:8px;font-size:12px">Benchmarks appear after the first full hour.</div>'}
+    <details style="margin-top:12px"><summary>Recent ticks</summary><div class="scroll"><table>
+      <thead><tr><th>At</th><th class="num">Value</th><th>Targets</th><th>Orders</th></tr></thead><tbody>${ticks}</tbody></table></div></details>
+    <details style="margin-top:8px"><summary>Strategy history</summary><table><tbody>${hist}</tbody></table></details>`;
+}
+
+// ---- reviews and narrative ----------------------------------------------------
+function renderReviews(r) {
+  state.running = r.running;
+  $("reviewPill").textContent = r.running ? "agent reviewing…" : "agent idle";
+  $("reviewPill").classList.toggle("live", r.running);
+  $("reviewBtn").disabled = r.running;
+  const runs = r.runs.map((run, i) => {
+    const status = !run.finished_at ? '<span class="warn">running</span>'
+      : run.exit_code === 0 ? '<span class="up">ok</span>' : `<span class="down">exit ${run.exit_code ?? "?"}</span>`;
+    const requested = /requested/i.test(run.prompt || "") ? ' <span class="badge">requested</span>' : "";
+    const took = run.finished_at ? ` · ${Math.max(1, Math.round((new Date(run.finished_at) - new Date(run.started_at)) / 1000))}s` : "";
+    return `<div class="run"><div><b>${when(run.started_at)}</b> <span class="muted">${esc(run.id)}</span> · ${status}${took}${requested}</div>
+      ${run.report ? `<details ${i === 0 ? "open" : ""}><summary>Report</summary>${report(run.report)}</details>` : ""}</div>`;
+  }).join("");
+  $("reviews").innerHTML = `<h2>Agent reviews</h2>${runs || '<div class="empty">No agent runs yet.</div>'}`;
+}
+function renderNarrative(r) {
+  const n = r.narrative;
+  const journal = (r.journal || []).map((e) => `<tr><td style="white-space:nowrap">${when(e.at)}</td><td>${esc(e.summary)}${(e.trade_ids || []).length ? ` <span class="muted">(${e.trade_ids.length} trades)</span>` : ""}</td></tr>`).join("");
+  $("narrative").innerHTML = `<h2>Narrative <span class="right muted">${n ? `${when(n.at)} · ${esc(n.run_id)}` : ""}</span></h2>
+    ${n ? `<div class="md">${markdown(n.body)}</div>` : '<div class="empty">No narrative yet.</div>'}
+    <details style="margin-top:12px"><summary>Journal</summary><table><tbody>${journal}</tbody></table></details>`;
+}
+
+// ---- loading and actions --------------------------------------------------------
+async function loadLatest() {
+  try { renderStats(await api("/api/snapshots/latest")); }
+  catch (e) { if (e.status === 404) renderStats(null); else throw e; }
+}
+async function loadEquity() { state.equity = (await api("/api/equity")).points; renderChart(); }
+async function loadStrategy() { renderStrategy(await api("/api/strategy")); }
+async function loadNarrative() { renderNarrative(await api("/api/narrative")); }
+async function loadReviews() {
+  const r = await api("/api/review");
+  const wasRunning = state.running, latest = r.runs[0]?.id;
+  renderReviews(r);
+  return { finished: wasRunning && !r.running, newRun: latest !== state.lastRunId && (state.lastRunId = latest) };
+}
+async function refreshAll() {
+  const results = await Promise.allSettled([loadLatest(), loadEquity(), loadSnapshots(), loadStrategy(), loadNarrative(), loadReviews()]);
+  const failed = results.find((r) => r.status === "rejected");
+  if (failed) toast("Refresh failed: " + failed.reason.message);
+  if (!state.selected && state.snaps[0]) selectSnapshot(state.snaps[0].id);
+}
+
+$("snapBtn").onclick = async () => {
+  const b = $("snapBtn");
+  b.disabled = true; b.textContent = "Pricing holdings…";
+  try {
+    const s = await api("/api/snapshots", { method: "POST" });
+    toast(`Snapshot #${s.id}: ${usd(s.value_usdc)} (${signedUsd(s.pnl_usdc)})`);
+    renderStats(s);
+    state.selected = s.id;
+    await Promise.all([loadEquity(), loadSnapshots()]);
+    renderDetail(s);
+  } catch (e) { toast("Snapshot failed: " + e.message); }
+  finally { b.disabled = false; b.textContent = "Take PnL snapshot"; }
+};
+$("reviewBtn").onclick = async () => {
+  $("reviewBtn").disabled = true;
+  try { await api("/api/review", { method: "POST" }); toast("Agent review started; this takes a minute or two."); }
+  catch (e) { toast(e.status === 409 ? "A review is already running." : "Could not start review: " + e.message); }
+  await loadReviews().catch(() => {});
+};
+$("kindTabs").onclick = (e) => {
+  const b = e.target.closest("button[data-kind]");
+  if (!b) return;
+  state.kind = b.dataset.kind;
+  for (const x of $("kindTabs").children) x.classList.toggle("on", x === b);
+  loadSnapshots().catch((e) => toast(e.message));
+};
+$("moreBtn").onclick = () => loadSnapshots(true).catch((e) => toast(e.message));
+$("snapRows").onclick = (e) => { const tr = e.target.closest("tr[data-id]"); if (tr) selectSnapshot(+tr.dataset.id); };
+$("detail").onclick = (e) => { const b = e.target.closest("button[data-go]"); if (b && b.dataset.go) selectSnapshot(+b.dataset.go); };
+
+// Poll the review status (fast while one runs) and refresh everything when
+// a run finishes; refresh the rest every minute.
+async function poll() {
+  try {
+    const { finished, newRun } = await loadReviews();
+    if (finished || newRun) await refreshAll();
+  } catch (_) {}
+  setTimeout(poll, state.running ? 4000 : 20000);
+}
+setInterval(() => { if (!document.hidden) Promise.allSettled([loadLatest(), loadEquity(), loadStrategy()]); }, 60000);
+
+chartEvents();
+refreshAll().then(() => setTimeout(poll, state.running ? 4000 : 20000));
+</script>
+</body>
+</html>
