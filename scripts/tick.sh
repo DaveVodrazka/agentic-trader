@@ -11,6 +11,7 @@ if [[ -f .env ]]; then
 fi
 mkdir -p logs
 {
-  "$REPO/bin/trader" -db "$REPO/trader.db" tick -q -wake "com.dave.agentic-trader.agent" 2>&1 \
-    || echo "$(date -u +%FT%TZ) tick failed (exit $?)"
+  rc=0
+  "$REPO/bin/trader" -db "$REPO/trader.db" tick -q -wake "com.dave.agentic-trader.agent" 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then echo "$(date -u +%FT%TZ) tick failed (exit $rc)"; fi
 } >> logs/tick.log

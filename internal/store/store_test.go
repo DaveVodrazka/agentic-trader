@@ -363,3 +363,36 @@ func TestWakeups(t *testing.T) {
 		t.Errorf("last run = %v %v", at, ok)
 	}
 }
+
+// Several processes opening a new database at once (e.g. the tick and agent
+// jobs starting together) must not race on migrations.
+func TestConcurrentOpenMigratesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "race.db")
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := Open(path) // separate *sql.DB, like a separate process
+			if err != nil {
+				errs <- err
+				return
+			}
+			s.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	s, err := Open(path)
+	must(t, err)
+	defer s.Close()
+	var v int
+	s.db.QueryRow(`PRAGMA user_version`).Scan(&v)
+	if v != len(migrations) {
+		t.Errorf("version = %d", v)
+	}
+}

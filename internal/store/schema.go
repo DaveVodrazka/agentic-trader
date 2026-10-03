@@ -243,25 +243,27 @@ CREATE INDEX wakeups_pending ON wakeups(run_id) WHERE run_id IS NULL;
 `,
 }
 
+// migrate applies pending migrations. The version is read inside the write
+// transaction (BEGIN IMMEDIATE via the DSN), so processes opening the
+// database at the same time cannot both apply the same migration.
 func (s *Store) migrate(ctx context.Context) error {
-	var version int
-	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
-	}
-	if version > len(migrations) {
-		return fmt.Errorf("database schema v%d is newer than this binary (v%d)", version, len(migrations))
-	}
-	for i := version; i < len(migrations); i++ {
-		err := s.tx(ctx, func(tx *sql.Tx) error {
-			if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
-				return err
-			}
-			_, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, i+1))
-			return err
-		})
-		if err != nil {
-			return fmt.Errorf("migrate to v%d: %w", i+1, err)
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		var version int
+		if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+			return fmt.Errorf("read schema version: %w", err)
 		}
-	}
-	return nil
+		if version > len(migrations) {
+			return fmt.Errorf("database schema v%d is newer than this binary (v%d)", version, len(migrations))
+		}
+		for i := version; i < len(migrations); i++ {
+			if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
+				return fmt.Errorf("migrate to v%d: %w", i+1, err)
+			}
+		}
+		if version == len(migrations) {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, len(migrations)))
+		return err
+	})
 }

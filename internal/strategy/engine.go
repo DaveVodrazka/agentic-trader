@@ -64,9 +64,32 @@ func (s *State) RecordFill(sym string, units, usd, newUnits float64) {
 		return
 	}
 	if units > 0 {
-		oldUnits := newUnits - units
-		s.Entry[sym] = (s.Entry[sym]*math.Max(oldUnits, 0) + usd) / newUnits
+		oldUnits := math.Max(newUnits-units, 0)
+		oldEntry, ok := s.Entry[sym]
+		if !ok {
+			// Units held without a known entry are valued at this fill's
+			// price, never at zero (which would disable the stop-loss).
+			oldEntry = usd / units
+		}
+		s.Entry[sym] = (oldEntry*oldUnits + usd) / newUnits
 	}
+}
+
+// adoptHoldings gives tokens already held (e.g. bought before this strategy
+// took over) an entry price at the current market price, so stop-losses and
+// returns are measured from when the strategy took responsibility.
+func (s *State) adoptHoldings(pf Portfolio) []string {
+	var adopted []string
+	for _, sym := range sortedKeys(pf.Values) {
+		if sym == Cash || pf.Values[sym] <= 0 || pf.Prices[sym] <= 0 {
+			continue
+		}
+		if _, ok := s.Entry[sym]; !ok {
+			s.Entry[sym] = pf.Prices[sym]
+			adopted = append(adopted, sym)
+		}
+	}
+	return adopted
 }
 
 // Order is a trade the engine wants. Sells are token -> USDC, buys USDC ->
@@ -122,6 +145,10 @@ func Step(s Strategy, now time.Time, data Data, pf Portfolio, st *State, rules R
 		plan.Targets = map[string]float64{}
 		plan.Orders = orders(pf, plan.Targets, 0, rules)
 		return plan, nil
+	}
+
+	if adopted := st.adoptHoldings(pf); len(adopted) > 0 {
+		plan.Events = append(plan.Events, "entry at market for held "+strings.Join(adopted, ", "))
 	}
 
 	// Per-position stop-losses.

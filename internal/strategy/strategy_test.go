@@ -234,3 +234,38 @@ func TestBacktestNeedsData(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 }
+
+// Regression: tokens held before a strategy took over used to count as
+// bought at $0, so a later buy averaged the entry far too low and the
+// stop-loss could never fire.
+func TestInheritedHoldingsEntryPrice(t *testing.T) {
+	s := build(t, "rebalance", `{"weights":{"SOL":0.6}}`)
+	st := &State{}
+	pf := Portfolio{Total: 1000, Values: map[string]float64{Cash: 600, "SOL": 400}, Units: map[string]float64{"SOL": 3.35},
+		Prices: map[string]float64{Cash: 1, "SOL": 119.4}}
+	plan, err := Step(s, t0, NewMemData(nil), pf, st, DefaultRules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Entry["SOL"] != 119.4 || !strings.Contains(plan.Note(), "entry at market for held SOL") {
+		t.Fatalf("entry = %v note=%q", st.Entry, plan.Note())
+	}
+	// The strategy buys 1.69 SOL at $119.61.
+	st.RecordFill("SOL", 1.6933, 202.54, 5.0437)
+	if e := st.Entry["SOL"]; e < 119.4 || e > 119.62 {
+		t.Errorf("entry after buy = %v, want ~119.5", e)
+	}
+	// And RecordFill alone never values unknown held units at zero.
+	fresh := &State{}
+	fresh.RecordFill("SOL", 1.6933, 202.54, 5.0437)
+	if e := fresh.Entry["SOL"]; e < 119.6 || e > 119.62 {
+		t.Errorf("fresh entry = %v, want 119.61", e)
+	}
+	// A 20% drop now trips the stop.
+	pf.Prices["SOL"] = 95
+	pf.Values["SOL"] = 5.0437 * 95
+	plan, _ = Step(s, t0, NewMemData(nil), pf, st, DefaultRules)
+	if len(plan.NewStops) != 1 || plan.NewStops[0] != "SOL" {
+		t.Errorf("stop not triggered: %+v", plan)
+	}
+}
