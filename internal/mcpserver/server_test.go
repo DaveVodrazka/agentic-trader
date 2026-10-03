@@ -13,6 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"agentic-trader/internal/memory"
+	"agentic-trader/internal/store"
 	"agentic-trader/internal/trading"
 	"agentic-trader/internal/venue"
 )
@@ -39,18 +40,32 @@ func (f fakeVenue) Quote(_ context.Context, r venue.QuoteRequest) (*venue.Quote,
 	return &venue.Quote{Venue: "fake", From: from, To: to, InAmount: in, OutAmount: out, MinOutAmount: out, FetchedAt: time.Now()}, nil
 }
 
-func connect(t *testing.T) (*mcp.ClientSession, string) {
+func connect(t *testing.T) (*mcp.ClientSession, *store.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	wp := filepath.Join(dir, "WALLET.json")
-	if err := os.WriteFile(wp, []byte(`{"balances":{"USDC":"1000","SOL":"0.1"}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	tokens := venue.NewTokenRegistry(venue.SolanaTokens...)
-	ledger, err := trading.OpenLedger(wp, filepath.Join(dir, "trades.jsonl"), tokens)
+	db, err := store.Open(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { db.Close() })
+	tokens := venue.NewTokenRegistry(venue.SolanaTokens...)
+	ctx0 := context.Background()
+	var toks []store.Token
+	for _, tk := range venue.SolanaTokens {
+		toks = append(toks, store.Token{Symbol: tk.Symbol, Mint: tk.Address, Decimals: tk.Decimals})
+	}
+	if err := db.UpsertTokens(ctx0, toks); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []store.Deposit{
+		{At: time.Now(), Symbol: "USDC", Amount: big.NewInt(1000e6), ValueUSDC: "1000"},
+		{At: time.Now(), Symbol: "SOL", Amount: big.NewInt(1e8), ValueUSDC: "1"},
+	} {
+		if err := db.AddDeposit(ctx0, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ledger := trading.NewLedger(db, tokens)
 	sol, _ := tokens.Lookup("SOL")
 	costs := trading.CostEstimator{Fees: trading.DefaultPaperFees, Pricer: trading.VenuePricer{Venue: fakeVenue{tokens}}, SOL: sol}
 	s := New(Config{
@@ -58,7 +73,8 @@ func connect(t *testing.T) (*mcp.ClientSession, string) {
 		Executor: trading.NewPaperExecutor(ledger, trading.DefaultLimits, costs),
 		Costs:    costs,
 		Ledger:   ledger,
-		Memory:   memory.NewStore(filepath.Join(dir, "NARRATIVE.md"), filepath.Join(dir, "journal.jsonl"), 0),
+		Memory:   memory.New(db, filepath.Join(dir, "NARRATIVE.md"), 0),
+		Store:    db,
 		QuoteTTL: trading.DefaultLimits.MaxQuoteAge,
 		RunID:    "run-test",
 	})
@@ -73,7 +89,7 @@ func connect(t *testing.T) (*mcp.ClientSession, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	return cs, dir
+	return cs, db, dir
 }
 
 func call[T any](t *testing.T, cs *mcp.ClientSession, name string, args any) (T, *mcp.CallToolResult) {
@@ -103,7 +119,7 @@ func errText(res *mcp.CallToolResult) string {
 }
 
 func TestQuoteExecuteFlow(t *testing.T) {
-	cs, _ := connect(t)
+	cs, _, _ := connect(t)
 
 	q, res := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "USDC", "to": "SOL", "amount": "100"})
 	if res.IsError {
@@ -135,7 +151,7 @@ func TestQuoteExecuteFlow(t *testing.T) {
 }
 
 func TestErrorsReachModel(t *testing.T) {
-	cs, _ := connect(t)
+	cs, _, _ := connect(t)
 
 	_, res := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "NOPE", "to": "SOL", "amount": "1"})
 	if !res.IsError || !strings.Contains(errText(res), "unknown token") {
@@ -150,7 +166,7 @@ func TestErrorsReachModel(t *testing.T) {
 }
 
 func TestNarrativeLinksRunTrades(t *testing.T) {
-	cs, dir := connect(t)
+	cs, db, dir := connect(t)
 
 	q, _ := call[QuoteOutput](t, cs, "get_quote", map[string]any{"from": "USDC", "to": "SOL", "amount": "10"})
 	// reason is required by the input schema.
@@ -176,9 +192,13 @@ func TestNarrativeLinksRunTrades(t *testing.T) {
 	if out.RunID != "run-test" || len(out.TradeIDs) != 1 || out.TradeIDs[0] != fill.TradeID {
 		t.Errorf("out = %+v, want trade %s", out, fill.TradeID)
 	}
-	trades, _ := os.ReadFile(filepath.Join(dir, "trades.jsonl"))
-	if !strings.Contains(string(trades), `"reason":"range bottom"`) || !strings.Contains(string(trades), `"run_id":"run-test"`) {
-		t.Errorf("trades = %s", trades)
+	trades, _ := db.Trades(context.Background())
+	if len(trades) != 1 || trades[0].Reason != "range bottom" || trades[0].RunID != "run-test" {
+		t.Errorf("trades = %+v", trades)
+	}
+	// Both quotes were recorded; only the executed one is linked to the trade.
+	if id, found, err := db.QuoteTrade(context.Background(), q.QuoteID); err != nil || !found || id != fill.TradeID {
+		t.Errorf("quote link = %q found=%v err=%v", id, found, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "NARRATIVE.md")); err != nil {
 		t.Error(err)

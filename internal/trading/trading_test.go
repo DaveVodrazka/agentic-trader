@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"math/big"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"agentic-trader/internal/store"
 	"agentic-trader/internal/venue"
 )
 
@@ -34,19 +34,38 @@ func units(t *testing.T, amount string, tk venue.Token) *big.Int {
 	return n
 }
 
-// newLedger writes a wallet with the given balances into a temp dir.
-func newLedger(t *testing.T, wallet string) (*Ledger, string, string) {
+// newLedger opens a temp database funded with the given deposits, e.g.
+// map{"USDC": "1000"}.
+func newLedger(t *testing.T, deposits map[string]string) (*Ledger, *store.Store) {
 	t.Helper()
-	dir := t.TempDir()
-	wp, tp := filepath.Join(dir, "WALLET.json"), filepath.Join(dir, "trades.jsonl")
-	if err := os.WriteFile(wp, []byte(wallet), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	l, err := OpenLedger(wp, tp, tokens)
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return l, wp, tp
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	var toks []store.Token
+	for _, tk := range venue.SolanaTokens {
+		toks = append(toks, store.Token{Symbol: tk.Symbol, Mint: tk.Address, Decimals: tk.Decimals})
+	}
+	if err := st.UpsertTokens(ctx, toks); err != nil {
+		t.Fatal(err)
+	}
+	for sym, amt := range deposits {
+		if err := st.AddDeposit(ctx, store.Deposit{At: time.Now(), Symbol: sym, Amount: units(t, amt, tok(t, sym)), ValueUSDC: "0"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return NewLedger(st, tokens), st
+}
+
+func balances(t *testing.T, l *Ledger) map[string]string {
+	t.Helper()
+	b, err := l.Balances(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func quote(t *testing.T, from, to, in, out string) *venue.Quote {
@@ -59,10 +78,18 @@ func quote(t *testing.T, from, to, in, out string) *venue.Quote {
 	}
 }
 
-const startWallet = `{"last_trade_seq":0,"balances":{"USDC":"1000","SOL":"0"}}`
+func order(q *venue.Quote) Order {
+	return Order{Quote: q, Reason: "test", RunID: "run-test"}
+}
 
-func TestPaperExecuteUpdatesWalletAndLog(t *testing.T) {
-	l, wp, tp := newLedger(t, startWallet)
+func noFees(t *testing.T) CostEstimator {
+	return CostEstimator{Fees: PaperFeeModel{}, SOL: tok(t, "SOL")}
+}
+
+var usdc1000 = map[string]string{"USDC": "1000"}
+
+func TestPaperExecuteUpdatesBalancesAndTrades(t *testing.T) {
+	l, st := newLedger(t, usdc1000)
 	ex := NewPaperExecutor(l, DefaultLimits, noFees(t))
 
 	fill, err := ex.Execute(context.Background(), order(quote(t, "USDC", "SOL", "100", "0.837083774")))
@@ -72,63 +99,31 @@ func TestPaperExecuteUpdatesWalletAndLog(t *testing.T) {
 	if !fill.Paper || !strings.HasPrefix(fill.ID, "paper-") {
 		t.Errorf("fill = %+v", fill)
 	}
-	got := l.Balances()
-	if got["USDC"] != "900" || got["SOL"] != "0.837083774" {
-		t.Errorf("balances = %v", got)
+	if b := balances(t, l); b["USDC"] != "900" || b["SOL"] != "0.837083774" {
+		t.Errorf("balances = %v", b)
 	}
-
-	// Files on disk reflect the trade, and reopening yields the same state.
-	if data, _ := os.ReadFile(tp); strings.Count(string(data), "\n") != 1 || !strings.Contains(string(data), `"seq":1`) {
-		t.Errorf("trades file = %s", data)
-	}
-	l2, err := OpenLedger(wp, tp, tokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b := l2.Balances(); b["USDC"] != "900" || b["SOL"] != "0.837083774" {
-		t.Errorf("reopened balances = %v", b)
-	}
-}
-
-func TestReplayAfterCrashBeforeSnapshot(t *testing.T) {
-	l, wp, tp := newLedger(t, startWallet)
-	ex := NewPaperExecutor(l, DefaultLimits, noFees(t))
-	if _, err := ex.Execute(context.Background(), order(quote(t, "USDC", "SOL", "100", "1"))); err != nil {
-		t.Fatal(err)
-	}
-	// Simulate a crash after the log append but before the snapshot: restore
-	// the old wallet file. Open must replay the missing trade.
-	if err := os.WriteFile(wp, []byte(startWallet), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	l2, err := OpenLedger(wp, tp, tokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b := l2.Balances(); b["USDC"] != "900" || b["SOL"] != "1" {
-		t.Errorf("replayed balances = %v", b)
-	}
-	if data, _ := os.ReadFile(wp); !strings.Contains(string(data), `"last_trade_seq": 1`) {
-		t.Errorf("snapshot not rewritten: %s", data)
+	trades, _ := st.Trades(context.Background())
+	if len(trades) != 1 || trades[0].Seq != 1 || trades[0].Reason != "test" || trades[0].RunID != "run-test" {
+		t.Errorf("trades = %+v", trades)
 	}
 }
 
 func TestInsufficientBalanceWritesNothing(t *testing.T) {
-	l, _, tp := newLedger(t, startWallet)
+	l, st := newLedger(t, usdc1000)
 	_, err := NewPaperExecutor(l, DefaultLimits, noFees(t)).Execute(context.Background(), order(quote(t, "USDC", "SOL", "1000.01", "8")))
-	if !errors.Is(err, ErrInsufficientBalance) {
-		t.Fatalf("err = %v, want ErrInsufficientBalance", err)
+	if !errors.Is(err, ErrInsufficientBalance) || !strings.Contains(err.Error(), "need 1000.01 USDC, have 1000") {
+		t.Fatalf("err = %v", err)
 	}
-	if _, err := os.Stat(tp); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("trades file should not exist, stat err = %v", err)
+	if trades, _ := st.Trades(context.Background()); len(trades) != 0 {
+		t.Error("trade written despite rejection")
 	}
-	if b := l.Balances(); b["USDC"] != "1000" {
+	if b := balances(t, l); b["USDC"] != "1000" {
 		t.Errorf("balances changed: %v", b)
 	}
 }
 
 func TestConcurrentExecuteCannotOverdraw(t *testing.T) {
-	l, _, _ := newLedger(t, startWallet)
+	l, _ := newLedger(t, usdc1000)
 	ex := NewPaperExecutor(l, DefaultLimits, noFees(t))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -145,13 +140,13 @@ func TestConcurrentExecuteCannotOverdraw(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if ok != 10 || l.Balances()["USDC"] != "0" {
-		t.Errorf("ok = %d, balances = %v", ok, l.Balances())
+	if b := balances(t, l); ok != 10 || b["USDC"] != "" {
+		t.Errorf("ok = %d, balances = %v", ok, b)
 	}
 }
 
 func TestLimits(t *testing.T) {
-	l, _, _ := newLedger(t, `{"balances":{"USDC":"1000","SOL":"1"}}`)
+	l, _ := newLedger(t, map[string]string{"USDC": "1000", "SOL": "1"})
 	ex := NewPaperExecutor(l, Limits{
 		MaxQuoteAge: 10 * time.Second,
 		MaxIn:       map[string]string{"USDC": "250"},
@@ -175,49 +170,12 @@ func TestLimits(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsUnknownToken(t *testing.T) {
-	dir := t.TempDir()
-	wp := filepath.Join(dir, "w.json")
-	os.WriteFile(wp, []byte(`{"balances":{"NOPE":"1"}}`), 0o644)
-	if _, err := OpenLedger(wp, filepath.Join(dir, "t.jsonl"), tokens); !errors.Is(err, venue.ErrUnknownToken) {
-		t.Fatalf("err = %v, want ErrUnknownToken", err)
-	}
-}
-
-// The real wallet file in the repo root must stay loadable.
-func TestRepoWalletLoads(t *testing.T) {
-	wp := filepath.Join("..", "..", DefaultWalletPath)
-	data, err := os.ReadFile(wp)
-	if err != nil {
-		t.Skip(err)
-	}
-	l, _, _ := newLedger(t, string(data))
-	if len(l.Balances()) == 0 {
-		t.Error("no balances loaded")
-	}
-}
-
-func order(q *venue.Quote) Order {
-	return Order{Quote: q, Reason: "test", RunID: "run-test"}
-}
-
-func TestReasonRequiredAndRecorded(t *testing.T) {
-	l, _, tp := newLedger(t, startWallet)
+func TestReasonRequired(t *testing.T) {
+	l, _ := newLedger(t, usdc1000)
 	ex := NewPaperExecutor(l, DefaultLimits, noFees(t))
 	if _, err := ex.Execute(context.Background(), Order{Quote: quote(t, "USDC", "SOL", "1", "0.01"), Reason: "  "}); !errors.Is(err, ErrMissingReason) {
 		t.Fatalf("err = %v, want ErrMissingReason", err)
 	}
-	if _, err := ex.Execute(context.Background(), Order{Quote: quote(t, "USDC", "SOL", "1", "0.01"), Reason: "range bottom", RunID: "run-1"}); err != nil {
-		t.Fatal(err)
-	}
-	data, _ := os.ReadFile(tp)
-	if !strings.Contains(string(data), `"run_id":"run-1"`) || !strings.Contains(string(data), `"reason":"range bottom"`) {
-		t.Errorf("trade record = %s", data)
-	}
-}
-
-func noFees(t *testing.T) CostEstimator {
-	return CostEstimator{Fees: PaperFeeModel{}, SOL: tok(t, "SOL")}
 }
 
 // fixedPricer prices tokens at fixed USDC prices.
@@ -231,8 +189,8 @@ func (p fixedPricer) ValueUSDC(_ context.Context, tk venue.Token, amount *big.In
 	return new(big.Rat).Mul(px, ratUnits(amount, tk.Decimals)), nil
 }
 
-func TestNetworkFeeDeductedFromSOL(t *testing.T) {
-	l, wp, tp := newLedger(t, `{"balances":{"USDC":"1000","SOL":"1"}}`)
+func TestNetworkFeeDeductedAndRecorded(t *testing.T) {
+	l, st := newLedger(t, map[string]string{"USDC": "1000", "SOL": "1"})
 	costs := CostEstimator{Fees: DefaultPaperFees, Pricer: fixedPricer{"SOL": "120"}, SOL: tok(t, "SOL")}
 	ex := NewPaperExecutor(l, DefaultLimits, costs)
 
@@ -243,7 +201,7 @@ func TestNetworkFeeDeductedFromSOL(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 1 + 0.8 - 0.000105 fee
-	if b := l.Balances(); b["SOL"] != "1.799895" || b["USDC"] != "900" {
+	if b := balances(t, l); b["SOL"] != "1.799895" || b["USDC"] != "900" {
 		t.Errorf("balances = %v", b)
 	}
 	// Fee 0.000105 SOL * 120 = 0.0126; impact on 100 USDC at 1% = 1.
@@ -253,40 +211,24 @@ func TestNetworkFeeDeductedFromSOL(t *testing.T) {
 	if got := fill.Costs.ImpactUSDC.FloatString(4); got != "1.0000" {
 		t.Errorf("impact usdc = %s", got)
 	}
-	data, _ := os.ReadFile(tp)
-	for _, want := range []string{`"network_sol":"0.000105"`, `"network_usdc":"0.012600"`, `"price_impact_pct":"1.0000"`, `"quoted_out":"0.8"`} {
-		if !strings.Contains(string(data), want) {
-			t.Errorf("trade record missing %s: %s", want, data)
-		}
-	}
-
-	// Replay applies the fee too.
-	if err := os.WriteFile(wp, []byte(`{"balances":{"USDC":"1000","SOL":"1"}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	l2, err := OpenLedger(wp, tp, tokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b := l2.Balances(); b["SOL"] != "1.799895" {
-		t.Errorf("replayed SOL = %s", b["SOL"])
+	trades, _ := st.Trades(context.Background())
+	f := trades[0].Fees
+	if f == nil || f.NetworkLamports != 105000 || f.NetworkUSDC != "0.012600" || f.PriceImpactPct != "1.0000" || trades[0].QuotedOut.String() != "800000000" {
+		t.Errorf("trade = %+v fees = %+v", trades[0], f)
 	}
 }
 
 func TestTradeRejectedWithoutSOLForFee(t *testing.T) {
-	l, _, tp := newLedger(t, startWallet) // 0 SOL
+	l, _ := newLedger(t, usdc1000) // 0 SOL
 	ex := NewPaperExecutor(l, DefaultLimits, CostEstimator{Fees: DefaultPaperFees, SOL: tok(t, "SOL")})
 	_, err := ex.Execute(context.Background(), order(quote(t, "USDC", "SOL", "100", "0.8")))
 	if !errors.Is(err, ErrInsufficientBalance) || !strings.Contains(err.Error(), "network fee") {
 		t.Fatalf("err = %v, want insufficient SOL for network fee", err)
 	}
-	if _, err := os.Stat(tp); !errors.Is(err, os.ErrNotExist) {
-		t.Error("trade logged despite rejection")
-	}
 }
 
 func TestSellingAllSOLLeavesNothingForFee(t *testing.T) {
-	l, _, _ := newLedger(t, `{"balances":{"SOL":"1"}}`)
+	l, _ := newLedger(t, map[string]string{"SOL": "1"})
 	ex := NewPaperExecutor(l, DefaultLimits, CostEstimator{Fees: DefaultPaperFees, SOL: tok(t, "SOL")})
 	if _, err := ex.Execute(context.Background(), order(quote(t, "SOL", "USDC", "1", "120"))); !errors.Is(err, ErrInsufficientBalance) {
 		t.Fatalf("err = %v, want ErrInsufficientBalance", err)
@@ -294,22 +236,8 @@ func TestSellingAllSOLLeavesNothingForFee(t *testing.T) {
 	if _, err := ex.Execute(context.Background(), order(quote(t, "SOL", "USDC", "0.99", "118"))); err != nil {
 		t.Fatal(err)
 	}
-	if b := l.Balances(); b["SOL"] != "0.009895" {
+	if b := balances(t, l); b["SOL"] != "0.009895" {
 		t.Errorf("SOL = %s", b["SOL"])
-	}
-}
-
-func TestLegacyTradesWithoutFeesReplay(t *testing.T) {
-	dir := t.TempDir()
-	wp, tp := filepath.Join(dir, "w.json"), filepath.Join(dir, "t.jsonl")
-	os.WriteFile(wp, []byte(`{"balances":{"USDC":"1000"}}`), 0o644)
-	os.WriteFile(tp, []byte(`{"seq":1,"from":"USDC","to":"SOL","in":"100","out":"0.8"}`+"\n"), 0o644)
-	l, err := OpenLedger(wp, tp, tokens)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b := l.Balances(); b["SOL"] != "0.8" || b["USDC"] != "900" {
-		t.Errorf("balances = %v", b)
 	}
 }
 

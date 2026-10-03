@@ -105,11 +105,11 @@ func (e *PaperExecutor) Execute(ctx context.Context, o Order) (*Fill, error) {
 		return nil, err
 	}
 	fee := e.costs.Fees.NetworkFeeLamports(q)
-	if err := e.checkReserve(q, e.costs.SOL, fee); err != nil {
+	if err := e.checkReserve(ctx, q, e.costs.SOL, fee); err != nil {
 		return nil, err
 	}
 	// Fail fast before spending API calls on pricing; Record re-checks atomically.
-	if err := e.ledger.CheckTrade(q.From, q.InAmount, new(big.Int).SetUint64(fee)); err != nil {
+	if err := e.ledger.CheckTrade(ctx, q.From, q.InAmount, fee); err != nil {
 		return nil, err
 	}
 	costs := e.costs.Estimate(ctx, q)
@@ -135,7 +135,7 @@ func (e *PaperExecutor) Execute(ctx context.Context, o Order) (*Fill, error) {
 	}
 	// Record re-checks the balance atomically, so concurrent executions
 	// cannot overdraw the wallet.
-	if _, err := e.ledger.Record(fill); err != nil {
+	if _, err := e.ledger.Record(ctx, fill); err != nil {
 		return nil, err
 	}
 	return fill, nil
@@ -143,7 +143,7 @@ func (e *PaperExecutor) Execute(ctx context.Context, o Order) (*Fill, error) {
 
 // checkReserve ensures a trade and its fee leave ReserveSOL behind. Checked
 // here rather than in the Ledger because it is policy, not bookkeeping.
-func (e *PaperExecutor) checkReserve(q *venue.Quote, sol venue.Token, feeLamports uint64) error {
+func (e *PaperExecutor) checkReserve(ctx context.Context, q *venue.Quote, sol venue.Token, feeLamports uint64) error {
 	if e.limits.ReserveSOL == "" {
 		return nil
 	}
@@ -158,7 +158,7 @@ func (e *PaperExecutor) checkReserve(q *venue.Quote, sol venue.Token, feeLamport
 	if q.From.Symbol == sol.Symbol {
 		need.Add(need, q.InAmount)
 	}
-	if err := e.ledger.CheckSpend(sol, need); err != nil {
+	if err := e.ledger.CheckSpend(ctx, sol, need); err != nil {
 		return fmt.Errorf("%w: must keep %s SOL for fees: %w", ErrLimitExceeded, e.limits.ReserveSOL, err)
 	}
 	return nil

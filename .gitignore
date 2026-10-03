@@ -1,19 +1,27 @@
+# Paths starting with / match only at the repo root.
+
 # Build output
-bin/
+/bin/
 /main
 
 # Secrets
-.env
+/.env
 
 # Per-user trading state: each clone starts its own wallet and history
-WALLET.json
-INITIAL_WALLET.json
-trades.jsonl
-journal.jsonl
-NARRATIVE.md
+/trader.db
+/trader.db-*
+/trader.db.import*
+/NARRATIVE.md
+/legacy/
+
+# Pre-database state files (imported by `make init`)
+/WALLET.json
+/INITIAL_WALLET.json
+/trades.jsonl
+/journal.jsonl
 
 # Runtime
-logs/
+/logs/
 *.lock
 .*.tmp
 

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"agentic-trader/internal/trading"
+	"agentic-trader/internal/store"
 	"agentic-trader/internal/venue"
 )
 
@@ -36,25 +36,29 @@ func (p priceVenue) Quote(_ context.Context, r venue.QuoteRequest) (*venue.Quote
 	return &venue.Quote{From: from, To: to, InAmount: in, OutAmount: n}, nil
 }
 
-func TestCompute(t *testing.T) {
+func units(s string, d uint8) *big.Int {
+	n, _ := venue.ParseUnits(s, d)
+	return n
+}
+
+func TestComputeAndSnapshot(t *testing.T) {
 	tokens := venue.NewTokenRegistry(venue.SolanaTokens...)
 	v := priceVenue{tokens, map[string]string{"SOL": "120", "WIF": "0.25"}}
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	initial := &InitialWallet{StartedAt: start, ValueUSDC: "1000", Balances: map[string]string{"USDC": "1000"}}
-	balances := map[string]string{"USDC": "500", "SOL": "4.5", "WIF": "400", "BONK": "0", "PUMP": "10"}
-	trades := []trading.TradeRecord{
-		{From: "USDC", To: "SOL", In: "400", Out: "3.35", At: start.Add(time.Hour)},
-		{From: "USDC", To: "WIF", In: "100", Out: "400", At: start.Add(2 * time.Hour),
-			Fees: &trading.FeeRecord{NetworkSOL: "0.000105", NetworkUSDC: "0.0126", ImpactUSDC: "0.5"}},
+	deposits := []store.Deposit{{At: start, Symbol: "USDC", Amount: units("1000", 6), ValueUSDC: "1000"}}
+	balances := map[string]*big.Int{"USDC": units("500", 6), "SOL": units("4.5", 9), "WIF": units("400", 6), "PUMP": units("10", 6)}
+	trades := []store.Trade{
+		{From: "USDC", To: "SOL", InAmount: units("400", 6), OutAmount: units("3.35", 9), At: start.Add(time.Hour)},
+		{From: "USDC", To: "WIF", InAmount: units("100", 6), OutAmount: units("400", 6), At: start.Add(2 * time.Hour),
+			Fees: &store.TradeFees{NetworkLamports: 105000, NetworkUSDC: "0.0126", ImpactUSDC: "0.5"}},
 	}
 
 	// Half a year later: 500 + 540 + 100 = 1140, PUMP unpriced.
-	r, err := Compute(context.Background(), v, initial, balances, trades, start.Add(year/2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.CurrentValue.FloatString(2) != "1140.00" || r.PnL.FloatString(2) != "140.00" {
-		t.Errorf("value=%s pnl=%s", r.CurrentValue.FloatString(2), r.PnL.FloatString(2))
+	val := Value(context.Background(), v, tokens, balances, start.Add(year/2))
+	r := Compute(deposits, val, trades, tokens)
+
+	if r.Total.FloatString(2) != "1140.00" || r.PnL.FloatString(2) != "140.00" {
+		t.Errorf("value=%s pnl=%s", r.Total.FloatString(2), r.PnL.FloatString(2))
 	}
 	if math.Abs(r.ReturnPct-14) > 1e-9 || math.Abs(r.APR-28) > 1e-9 || math.Abs(r.APY-(1.14*1.14-1)*100) > 1e-9 {
 		t.Errorf("return=%v apr=%v apy=%v", r.ReturnPct, r.APR, r.APY)
@@ -73,5 +77,37 @@ func TestCompute(t *testing.T) {
 	}
 	if r.Trades.Count != 2 || r.Trades.VolumeUSDC.FloatString(0) != "500" || r.Trades.ByPair["USDC->SOL"] != 1 {
 		t.Errorf("trades=%+v", r.Trades)
+	}
+
+	r.Runs = 7
+	snap := r.Snapshot(store.KindRun, "run-1")
+	if snap.Complete || snap.ValueUSDC != "1140.000000" || snap.PnLUSDC != "140.000000" || snap.ReturnPct != "14.0000" ||
+		snap.APRPct != "28.0000" || snap.CostsUSDC != "0.512600" || snap.TradeCount != 2 || snap.RunCount != 7 || len(snap.Holdings) != 4 {
+		t.Errorf("snapshot = %+v", snap)
+	}
+	sol := snap.Holdings[0]
+	if sol.Symbol != "SOL" || sol.PriceUSDC != "120.000000000000" || sol.Amount.String() != "4500000000" {
+		t.Errorf("SOL holding = %+v", sol)
+	}
+	if pump := snap.Holdings[3]; pump.Symbol != "PUMP" || pump.PriceUSDC != "" || pump.Error != "no route" {
+		t.Errorf("PUMP holding = %+v", pump)
+	}
+}
+
+func TestInitialSnapshot(t *testing.T) {
+	tokens := venue.NewTokenRegistry(venue.SolanaTokens...)
+	start := time.Date(2026, 10, 3, 10, 46, 10, 0, time.UTC)
+	snap := InitialSnapshot([]store.Deposit{
+		{At: start, Symbol: "USDC", Amount: units("1000", 6), ValueUSDC: "1000"},
+		{At: start, Symbol: "SOL", Amount: units("0.05", 9), ValueUSDC: "6"},
+	}, tokens)
+	if snap.Kind != store.KindInitial || !snap.TakenAt.Equal(start) || snap.ValueUSDC != "1006.000000" || snap.PnLUSDC != "0" || snap.APRPct != "" {
+		t.Errorf("snapshot = %+v", snap)
+	}
+	if h := snap.Holdings[1]; h.Symbol != "SOL" || h.PriceUSDC != "120.000000000000" {
+		t.Errorf("SOL = %+v", h)
+	}
+	if snap.Holdings[0].PriceUSDC != "1.000000000000" || snap.CashPct != "99.4036" {
+		t.Errorf("USDC = %+v cash=%s", snap.Holdings[0], snap.CashPct)
 	}
 }

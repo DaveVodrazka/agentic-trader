@@ -1,26 +1,29 @@
-// Package memory persists the agent's reasoning across activations: a
+// Package memory manages the agent's reasoning across activations: a
 // bounded, rewritten narrative (working memory) and an append-only journal
-// (history).
+// (history), both stored in the database. The latest narrative is also
+// written to a markdown file for humans to read.
 package memory
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"agentic-trader/internal/fsutil"
+	"agentic-trader/internal/store"
 )
 
-// Default file locations, relative to the working directory.
-const (
-	DefaultNarrativePath = "NARRATIVE.md"
-	DefaultJournalPath   = "journal.jsonl"
-	// DefaultMaxNarrativeBytes keeps the narrative small enough to load every
-	// run and forces the agent to drop stale reasoning.
-	DefaultMaxNarrativeBytes = 4096
-)
+// DefaultNarrativePath is the human-readable copy of the latest narrative.
+const DefaultNarrativePath = "NARRATIVE.md"
+
+// DefaultMaxNarrativeBytes keeps the narrative small enough to load every
+// run and forces the agent to drop stale reasoning.
+const DefaultMaxNarrativeBytes = 4096
+
+// RecentJournalEntries is how many journal entries the agent sees each run.
+const RecentJournalEntries = 5
 
 // RequiredSections must appear as "## <name>" headings in the narrative.
 var RequiredSections = []string{
@@ -40,72 +43,105 @@ var (
 
 const maxJournalBytes = 4096
 
-// JournalEntry is one line of the journal.
-type JournalEntry struct {
-	RunID    string    `json:"run_id"`
-	At       time.Time `json:"at"`
-	Summary  string    `json:"summary"`             // what the agent saw, decided and why
-	TradeIDs []string  `json:"trade_ids,omitempty"` // trades executed this run
+// Memory validates and stores narratives and journal entries.
+type Memory struct {
+	st       *store.Store
+	viewPath string // "" disables the markdown copy
+	maxBytes int
+	now      func() time.Time
 }
 
-// Store reads and writes the narrative and journal. Safe for concurrent use.
-type Store struct {
-	mu            sync.Mutex
-	narrativePath string
-	journalPath   string
-	maxBytes      int
-	now           func() time.Time
-}
-
-// NewStore returns a Store over the given files. maxBytes <= 0 uses the default.
-func NewStore(narrativePath, journalPath string, maxBytes int) *Store {
+// New returns a Memory over st. viewPath is where the latest narrative is
+// mirrored as markdown ("" to disable). maxBytes <= 0 uses the default.
+func New(st *store.Store, viewPath string, maxBytes int) *Memory {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxNarrativeBytes
 	}
-	return &Store{narrativePath: narrativePath, journalPath: journalPath, maxBytes: maxBytes, now: time.Now}
+	return &Memory{st: st, viewPath: viewPath, maxBytes: maxBytes, now: time.Now}
 }
 
 // MaxBytes is the narrative size limit.
-func (s *Store) MaxBytes() int { return s.maxBytes }
+func (m *Memory) MaxBytes() int { return m.maxBytes }
 
-// Update validates and stores a new narrative, and appends a journal entry.
-// The journal is appended first: if the narrative write fails, the run's
-// record still survives.
-func (s *Store) Update(runID, narrative, summary string, tradeIDs []string) (JournalEntry, error) {
+// Update validates and stores a new narrative version and a journal entry
+// for runID. The markdown copy is refreshed afterwards; failing to write it
+// is reported but the update itself is already saved.
+func (m *Memory) Update(ctx context.Context, runID, narrative, summary string) error {
 	narrative = strings.TrimSpace(narrative)
 	summary = strings.TrimSpace(summary)
-	if err := s.validate(narrative); err != nil {
-		return JournalEntry{}, err
+	if err := m.validate(narrative); err != nil {
+		return err
 	}
 	if summary == "" {
-		return JournalEntry{}, ErrEmptyJournalEntry
+		return ErrEmptyJournalEntry
 	}
 	if len(summary) > maxJournalBytes {
-		return JournalEntry{}, fmt.Errorf("%w: %d bytes, max %d", ErrJournalEntryTooBig, len(summary), maxJournalBytes)
+		return fmt.Errorf("%w: %d bytes, max %d", ErrJournalEntryTooBig, len(summary), maxJournalBytes)
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entry := JournalEntry{RunID: runID, At: s.now().UTC(), Summary: summary, TradeIDs: tradeIDs}
-	line, err := fsutil.MarshalLine(entry)
-	if err != nil {
-		return JournalEntry{}, err
+	at := m.now()
+	if err := m.st.SaveNarrative(ctx, runID, narrative, summary, at); err != nil {
+		return err
 	}
-	if err := fsutil.AppendLine(s.journalPath, line); err != nil {
-		return JournalEntry{}, err
-	}
-
-	header := fmt.Sprintf("<!-- updated %s by run %s -->\n", entry.At.Format(time.RFC3339), runID)
-	if err := fsutil.WriteFileAtomic(s.narrativePath, []byte(header+narrative+"\n")); err != nil {
-		return entry, fmt.Errorf("journal saved but narrative write failed: %w", err)
-	}
-	return entry, nil
+	return m.writeView(store.Narrative{RunID: runID, At: at, Body: narrative})
 }
 
-func (s *Store) validate(narrative string) error {
-	if n := len(narrative); n > s.maxBytes {
-		return fmt.Errorf("%w: %d bytes, max %d; compress it and drop stale points", ErrNarrativeTooLong, n, s.maxBytes)
+// WriteView refreshes the markdown copy from the latest stored narrative.
+func (m *Memory) WriteView(ctx context.Context) error {
+	n, ok, err := m.st.LatestNarrative(ctx)
+	if err != nil || !ok {
+		return err
+	}
+	return m.writeView(n)
+}
+
+func (m *Memory) writeView(n store.Narrative) error {
+	if m.viewPath == "" {
+		return nil
+	}
+	header := fmt.Sprintf("<!-- generated from trader.db; edits are ignored. updated %s by run %s -->\n",
+		n.At.UTC().Format(time.RFC3339), n.RunID)
+	if err := fsutil.WriteFileAtomic(m.viewPath, []byte(header+n.Body+"\n")); err != nil {
+		return fmt.Errorf("narrative saved, but writing %s failed: %w", m.viewPath, err)
+	}
+	return nil
+}
+
+// Context renders the memory block given to the agent at the start of a run.
+func (m *Memory) Context(ctx context.Context, runID string) (string, error) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Memory from previous runs\n\nCurrent time: %s\nRun ID: %s\n\n## Your narrative\n",
+		m.now().UTC().Format(time.RFC3339), runID)
+	n, ok, err := m.st.LatestNarrative(ctx)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		fmt.Fprintf(&b, "(written %s by %s)\n%s\n", n.At.UTC().Format(time.RFC3339), n.RunID, n.Body)
+	} else {
+		b.WriteString("(none yet — this is your first run)\n")
+	}
+
+	b.WriteString("\n## Recent journal entries (newest last)\n")
+	entries, err := m.st.Journal(ctx, RecentJournalEntries)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 0 {
+		b.WriteString("(empty)\n")
+	}
+	for _, e := range entries {
+		fmt.Fprintf(&b, "- %s %s: %s", e.At.UTC().Format(time.RFC3339), e.RunID, e.Summary)
+		if len(e.TradeIDs) > 0 {
+			fmt.Fprintf(&b, " [trades: %s]", strings.Join(e.TradeIDs, ", "))
+		}
+		b.WriteString("\n")
+	}
+	return b.String(), nil
+}
+
+func (m *Memory) validate(narrative string) error {
+	if n := len(narrative); n > m.maxBytes {
+		return fmt.Errorf("%w: %d bytes, max %d; compress it and drop stale points", ErrNarrativeTooLong, n, m.maxBytes)
 	}
 	var missing []string
 	for _, sec := range RequiredSections {

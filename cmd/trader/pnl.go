@@ -1,77 +1,56 @@
-// Command pnl prints a profit-and-loss summary of the trading wallet versus
-// the initial wallet, valuing holdings at live Jupiter prices. Read-only.
 package main
 
 import (
-	"bufio"
 	"context"
-	"flag"
 	"fmt"
-	"log"
 	"math"
 	"math/big"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
-	"agentic-trader/internal/memory"
 	"agentic-trader/internal/pnl"
-	"agentic-trader/internal/trading"
+	"agentic-trader/internal/store"
 	"agentic-trader/internal/venue"
 )
 
-func main() {
-	log.SetFlags(0)
-	log.SetPrefix("pnl: ")
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func run() error {
-	initialPath := flag.String("initial", pnl.DefaultInitialWalletPath, "initial wallet file")
-	walletPath := flag.String("wallet", trading.DefaultWalletPath, "wallet snapshot file")
-	tradesPath := flag.String("trades", trading.DefaultTradesPath, "trade log")
-	journalPath := flag.String("journal", memory.DefaultJournalPath, "agent journal")
-	flag.Parse()
-
-	tokens := venue.NewTokenRegistry(venue.SolanaTokens...)
-	initial, err := pnl.ReadInitialWallet(*initialPath)
-	if err != nil {
-		return err
-	}
-	balances, err := trading.ReadBalances(*walletPath, *tradesPath, tokens)
-	if err != nil {
-		return err
-	}
-	trades, err := trading.ReadTrades(*tradesPath)
-	if err != nil {
-		return err
-	}
-	jup := venue.NewJupiter(venue.WithJupiterTokens(tokens), venue.WithJupiterAPIKey(os.Getenv("JUPITER_API_KEY")))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// cmdPnL values the wallet at live prices, saves the result as a manual
+// snapshot and prints it.
+func cmdPnL(ctx context.Context, app *app) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	r, err := pnl.Compute(ctx, jup, initial, balances, trades, time.Now())
+	r, snap, err := pnl.Take(ctx, app.store, app.jupiter(), app.tokens, store.KindManual, "")
 	if err != nil {
 		return err
 	}
-	r.Runs = countLines(*journalPath)
-	printReport(r)
+	printReport(r, app.tokens)
+
+	// Compare with the previous snapshot on the PnL timeline.
+	prevID, _, err := app.store.AdjacentSnapshots(ctx, snap.ID, store.KindManual, store.KindInitial)
+	if err != nil {
+		return err
+	}
+	line := fmt.Sprintf("Saved as snapshot #%d", snap.ID)
+	if prev, ok, err := app.store.GetSnapshot(ctx, prevID); err == nil && ok {
+		pv, _ := new(big.Rat).SetString(prev.ValueUSDC)
+		delta := new(big.Rat).Sub(r.Total, pv)
+		line += fmt.Sprintf(" · %s since #%d (%s, %s ago)", color(signed(delta), delta.Sign()), prev.ID, prev.Kind,
+			humanDuration(snap.TakenAt.Sub(prev.TakenAt)))
+	}
+	fmt.Printf("  %s\n\n", line)
 	return nil
 }
 
-func printReport(r *pnl.Report) {
+func printReport(r *pnl.Report, tokens *venue.TokenRegistry) {
 	fmt.Println()
 	fmt.Println("  PORTFOLIO PnL")
 	fmt.Println("  " + strings.Repeat("─", 52))
 	row("Started", r.StartedAt.Local().Format("2006-01-02 15:04 MST"))
-	row("Valued", r.ValuedAt.Local().Format("2006-01-02 15:04 MST"))
+	row("Valued", r.At.Local().Format("2006-01-02 15:04 MST"))
 	row("Running for", humanDuration(r.Elapsed))
 	fmt.Println()
 	row("Initial value", usd(r.InitialValue))
-	current := usd(r.CurrentValue)
+	current := usd(r.Total)
 	if r.Unvalued > 0 {
 		current += fmt.Sprintf("  \033[33m⚠ incomplete: %d holding(s) unpriced\033[0m", r.Unvalued)
 	}
@@ -98,7 +77,7 @@ func printReport(r *pnl.Report) {
 		}
 		fmt.Printf("  %-6s %22s  %s\n", h.Symbol, h.Amount, val)
 	}
-	fmt.Printf("  %-6s %22s  %s\n", "start", "", initialSummary(r.Initial))
+	fmt.Printf("  %-6s %22s  %s\n", "start", "", depositSummary(r.Deposits, tokens))
 	if r.Unvalued > 0 {
 		fmt.Printf("  \033[33m⚠ %d holding(s) could not be priced; current value is understated\033[0m\n", r.Unvalued)
 	}
@@ -115,7 +94,7 @@ func printReport(r *pnl.Report) {
 			row("Turnover", fmt.Sprintf("%.2fx initial capital", turnover))
 		}
 		row("First trade", r.Trades.First.Local().Format("2006-01-02 15:04"))
-		row("Last trade", r.Trades.Last.Local().Format("2006-01-02 15:04")+"  ("+humanDuration(r.ValuedAt.Sub(r.Trades.Last))+" ago)")
+		row("Last trade", r.Trades.Last.Local().Format("2006-01-02 15:04")+"  ("+humanDuration(r.At.Sub(r.Trades.Last))+" ago)")
 		row("Pairs", pairs(r.Trades.ByPair))
 	}
 	row("Cash (USDC)", fmt.Sprintf("%.1f%% of portfolio", r.CashPct*100))
@@ -241,17 +220,16 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%dm", m)
 }
 
-func initialSummary(b map[string]string) string {
-	keys := make([]string, 0, len(b))
-	for k := range b {
-		keys = append(keys, k)
+func depositSummary(ds []store.Deposit, tokens *venue.TokenRegistry) string {
+	parts := make([]string, 0, len(ds))
+	for _, d := range ds {
+		amt := d.Amount.String()
+		if tok, err := tokens.Lookup(d.Symbol); err == nil {
+			amt = venue.FormatUnits(d.Amount, tok.Decimals)
+		}
+		parts = append(parts, amt+" "+d.Symbol)
 	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, b[k]+" "+k)
-	}
-	return "\033[2mstarted with " + strings.Join(parts, ", ") + "\033[0m"
+	return "\033[2mdeposited " + strings.Join(parts, ", ") + "\033[0m"
 }
 
 func pairs(m map[string]int) string {
@@ -276,21 +254,4 @@ func errShort(err error) string {
 		s = s[:40] + "…"
 	}
 	return s
-}
-
-func countLines(path string) int {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	n := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		if strings.TrimSpace(sc.Text()) != "" {
-			n++
-		}
-	}
-	return n
 }

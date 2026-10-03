@@ -15,7 +15,8 @@ if [[ -f .env ]]; then
   set -a; source .env; set +a
 fi
 
-BIN="$REPO/bin/trader-mcp"
+BIN="$REPO/bin/trader"
+DB="$REPO/trader.db"
 if [[ ! -x "$BIN" ]]; then
   echo "missing $BIN; run 'make build' first" >&2
   exit 1
@@ -27,34 +28,11 @@ TIMEOUT="${TRADER_TIMEOUT:-600}"
 mkdir -p logs
 LOG="logs/${TRADER_RUN_ID}.log"
 
-if [[ -s NARRATIVE.md ]]; then
-  narrative="$(cat NARRATIVE.md)"
-else
-  narrative="(none yet — this is your first run)"
-fi
-if [[ -s journal.jsonl ]]; then
-  journal="$(tail -n 5 journal.jsonl)"
-else
-  journal="(empty)"
-fi
+# Records the run start and returns the agent's memory (narrative + journal).
+memory="$("$BIN" -db "$DB" begin-run -run-id "$TRADER_RUN_ID" -prompt "$PROMPT")"
 
-memory="# Memory from previous runs
-
-Current time: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-Run ID: ${TRADER_RUN_ID}
-
-## Your narrative (NARRATIVE.md)
-${narrative}
-
-## Recent journal entries (newest last)
-${journal}"
-
-# Absolute paths so the server works regardless of the caller's cwd.
-mcp_config=$(jq -n --arg bin "$BIN" --arg repo "$REPO" '{mcpServers: {trader: {
-  command: $bin,
-  args: ["-wallet", "\($repo)/WALLET.json", "-trades", "\($repo)/trades.jsonl",
-         "-narrative", "\($repo)/NARRATIVE.md", "-journal", "\($repo)/journal.jsonl"]
-}}}')
+mcp_config=$(jq -n --arg bin "$BIN" --arg db "$DB" \
+  '{mcpServers: {trader: {command: $bin, args: ["-db", $db, "mcp"]}}}')
 
 echo "== ${TRADER_RUN_ID} started $(date -u +%FT%TZ)" | tee "$LOG"
 
@@ -75,4 +53,7 @@ kill "$watchdog" 2>/dev/null || true
 wait "$watchdog" 2>/dev/null || true
 
 echo "== ${TRADER_RUN_ID} finished $(date -u +%FT%TZ) exit=${rc}" | tee -a "$LOG"
+
+# Store the outcome and snapshot the portfolio (equity curve).
+"$BIN" -db "$DB" end-run -run-id "$TRADER_RUN_ID" -exit-code "$rc" -log "$LOG" | tee -a "$LOG" || true
 exit "$rc"

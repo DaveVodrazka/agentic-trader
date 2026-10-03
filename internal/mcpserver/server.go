@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"agentic-trader/internal/memory"
+	"agentic-trader/internal/store"
 	"agentic-trader/internal/trading"
 	"agentic-trader/internal/venue"
 )
@@ -27,7 +30,8 @@ type Config struct {
 	Venue    venue.Venue
 	Executor trading.Executor
 	Ledger   *trading.Ledger
-	Memory   *memory.Store
+	Memory   *memory.Memory
+	Store    *store.Store // records quotes and prices
 	Costs    trading.CostEstimator
 	// QuoteTTL should match the executor's MaxQuoteAge so the expires_at
 	// reported to the model is accurate.
@@ -125,6 +129,7 @@ func (s *Server) getQuote(ctx context.Context, _ *mcp.CallToolRequest, in GetQuo
 	s.pruneLocked()
 	s.quotes[id] = q
 	s.mu.Unlock()
+	s.recordQuote(ctx, id, q)
 
 	return nil, QuoteOutput{
 		QuoteID:        id,
@@ -141,6 +146,46 @@ func (s *Server) getQuote(ctx context.Context, _ *mcp.CallToolRequest, in GetQuo
 		Route:          q.Route,
 		ExpiresAt:      q.FetchedAt.Add(s.cfg.QuoteTTL).UTC(),
 	}, nil
+}
+
+// recordQuote stores the quote and, if one leg is USDC, a price point.
+// Failures are logged, not returned: history must not block trading.
+func (s *Server) recordQuote(ctx context.Context, id string, q *venue.Quote) {
+	route, _ := json.Marshal(q.Route)
+	err := s.cfg.Store.RecordQuote(ctx, store.Quote{
+		QuoteID: id, RunID: s.cfg.RunID, At: q.FetchedAt, Venue: q.Venue, From: q.From.Symbol, To: q.To.Symbol,
+		InAmount: q.InAmount, OutAmount: q.OutAmount, MinOut: q.MinOutAmount,
+		Price: q.Price().FloatString(int(q.To.Decimals)), PriceImpactPct: q.PriceImpactPercent(), Route: string(route),
+	})
+	if err != nil {
+		log.Printf("record quote %s: %v", id, err)
+		return
+	}
+	if p, ok := quotePrice(q); ok {
+		if err := s.cfg.Store.RecordPrices(ctx, []store.Price{p}); err != nil {
+			log.Printf("record price: %v", err)
+		}
+	}
+}
+
+// quotePrice derives the non-USDC token's USDC price from a quote with a
+// USDC leg. The price is the effective rate (after impact and pool fees).
+func quotePrice(q *venue.Quote) (store.Price, bool) {
+	in := new(big.Rat).SetFrac(q.InAmount, pow10(q.From.Decimals))
+	out := new(big.Rat).SetFrac(q.OutAmount, pow10(q.To.Decimals))
+	switch {
+	case in.Sign() == 0 || out.Sign() == 0:
+		return store.Price{}, false
+	case q.From.Symbol == "USDC" && q.To.Symbol != "USDC":
+		return store.Price{At: q.FetchedAt, Symbol: q.To.Symbol, USDC: new(big.Rat).Quo(in, out).FloatString(12), Source: "quote"}, true
+	case q.To.Symbol == "USDC" && q.From.Symbol != "USDC":
+		return store.Price{At: q.FetchedAt, Symbol: q.From.Symbol, USDC: new(big.Rat).Quo(out, in).FloatString(12), Source: "quote"}, true
+	}
+	return store.Price{}, false
+}
+
+func pow10(d uint8) *big.Int {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(d)), nil)
 }
 
 // CostsOutput is the cost breakdown shown to the agent. Price impact and
@@ -211,6 +256,13 @@ func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in Execute
 	s.mu.Lock()
 	s.tradeIDs = append(s.tradeIDs, fill.ID)
 	s.mu.Unlock()
+	if err := s.cfg.Store.MarkQuoteExecuted(ctx, in.QuoteID, fill.ID); err != nil {
+		log.Printf("link quote %s to trade %s: %v", in.QuoteID, fill.ID, err)
+	}
+	balances, err := s.cfg.Ledger.Balances(ctx)
+	if err != nil {
+		return nil, ExecuteOutput{}, fmt.Errorf("trade %s executed, but reading balances failed: %w", fill.ID, err)
+	}
 	return nil, ExecuteOutput{
 		TradeID:  fill.ID,
 		From:     fill.From.Symbol,
@@ -220,7 +272,7 @@ func (s *Server) execute(ctx context.Context, _ *mcp.CallToolRequest, in Execute
 		Price:    fill.Price,
 		FeeSOL:   fill.Costs.NetworkSOL(),
 		At:       fill.At.UTC(),
-		Balances: s.cfg.Ledger.Balances(),
+		Balances: balances,
 	}, nil
 }
 
@@ -229,8 +281,12 @@ type BalancesOutput struct {
 	Balances map[string]string `json:"balances"`
 }
 
-func (s *Server) getBalances(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, BalancesOutput, error) {
-	return nil, BalancesOutput{Balances: s.cfg.Ledger.Balances()}, nil
+func (s *Server) getBalances(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, BalancesOutput, error) {
+	b, err := s.cfg.Ledger.Balances(ctx)
+	if err != nil {
+		return nil, BalancesOutput{}, err
+	}
+	return nil, BalancesOutput{Balances: b}, nil
 }
 
 // UpdateNarrativeInput is the input of update_narrative.
@@ -246,16 +302,14 @@ type UpdateNarrativeOutput struct {
 	Saved    bool     `json:"saved"`
 }
 
-func (s *Server) updateNarrative(_ context.Context, _ *mcp.CallToolRequest, in UpdateNarrativeInput) (*mcp.CallToolResult, UpdateNarrativeOutput, error) {
-	s.mu.Lock()
-	ids := append([]string(nil), s.tradeIDs...)
-	s.mu.Unlock()
-
-	entry, err := s.cfg.Memory.Update(s.cfg.RunID, in.Narrative, in.Summary, ids)
-	if err != nil {
+func (s *Server) updateNarrative(ctx context.Context, _ *mcp.CallToolRequest, in UpdateNarrativeInput) (*mcp.CallToolResult, UpdateNarrativeOutput, error) {
+	if err := s.cfg.Memory.Update(ctx, s.cfg.RunID, in.Narrative, in.Summary); err != nil {
 		return nil, UpdateNarrativeOutput{}, err
 	}
-	return nil, UpdateNarrativeOutput{RunID: entry.RunID, TradeIDs: entry.TradeIDs, Saved: true}, nil
+	s.mu.Lock()
+	ids := append([]string{}, s.tradeIDs...)
+	s.mu.Unlock()
+	return nil, UpdateNarrativeOutput{RunID: s.cfg.RunID, TradeIDs: ids, Saved: true}, nil
 }
 
 // pruneLocked drops quotes past their TTL so the store doesn't grow unbounded.

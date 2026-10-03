@@ -2,16 +2,19 @@
 
 INTERVAL ?= 300
 PROMPT   ?= Run your trading cycle.
-BIN      := bin/trader-mcp
+BIN      := bin/trader
 
 .DEFAULT_GOAL := help
-.PHONY: help build test run start stop restart status logs pnl journal trades clean
+.PHONY: help init build test run start stop restart status logs pnl narrative journal trades clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-build: ## Build the MCP server binary
-	go build -o $(BIN) ./cmd/trader-mcp
+init: build ## Create trader.db (imports old JSON files if present; else USDC= SOL= deposits)
+	@set -a; [ -f .env ] && . ./.env; set +a; $(BIN) init $(if $(USDC),-usdc $(USDC)) $(if $(SOL),-sol $(SOL))
+
+build: ## Build the trader binary
+	go build -o $(BIN) ./cmd/trader
 
 test: ## Run tests
 	go test -race ./...
@@ -34,14 +37,17 @@ logs: ## Follow the latest run log
 	@latest=$$(ls -t logs/run-*.log 2>/dev/null | head -n 1); \
 	if [ -z "$$latest" ]; then echo "no runs yet"; else tail -f "$$latest"; fi
 
-pnl: ## Show profit & loss vs the initial wallet at live prices
-	@set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/pnl
+pnl: build ## Show profit & loss at live prices and save it as a snapshot
+	@set -a; [ -f .env ] && . ./.env; set +a; $(BIN) pnl
 
-journal: ## Show the agent's journal, one entry per run
-	@[ -s journal.jsonl ] && jq -r '"\(.at)  \(.run_id)\n  \(.summary)\n  trades: \(.trade_ids // [] | join(", "))\n"' journal.jsonl || echo "no journal yet"
+narrative: build ## Show the agent's latest narrative
+	@$(BIN) narrative
 
-trades: ## Show executed trades with the agent's reasons
-	@[ -s trades.jsonl ] && jq -r '"\(.at)  \(.in) \(.from) -> \(.out) \(.to) @ \(.price)\n  why: \(.reason // "-")\n"' trades.jsonl || echo "no trades yet"
+journal: build ## Show the agent's journal, one entry per run
+	@$(BIN) journal
 
-clean: ## Remove build output (keeps wallet, trades, narrative, logs)
+trades: build ## Show executed trades with reasons and fees
+	@$(BIN) trades
+
+clean: ## Remove build output (keeps trader.db and logs)
 	rm -rf bin
